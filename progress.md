@@ -59,6 +59,24 @@
   - `task_plan.md`
   - `progress.md`
 
+### 阶段 6：字体搜索与下拉滚动条
+- **状态：** complete
+- 执行的操作：
+  - 新增 Rust `list_fonts` 命令，Windows 下从 HKLM/HKCU 字体注册表枚举字体族名。
+  - 前端字体选择从原生 `select` 改为自绘 combobox。
+  - 字体下拉支持搜索、Enter 选择首项、Esc 收起、点击外部收起。
+  - 自绘下拉滚动条改为主题色。
+  - 运行构建和 dev 启动验证。
+- 创建/修改的文件：
+  - `src-tauri/Cargo.toml`
+  - `src-tauri/Cargo.lock`
+  - `src-tauri/src/lib.rs`
+  - `src/main.ts`
+  - `src/styles.css`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -66,6 +84,10 @@
 | `cargo check` | Rust 后端 | 编译检查通过 | 通过 | 通过 |
 | `npm run tauri -- info` | npm wrapper | 能识别 cargo/rustc | 通过 | 通过 |
 | `npm run tauri dev` | 实际启动 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止 | 通过 |
+| `npm run build` | 字体搜索修复后 | TypeScript/Vite 构建通过 | 构建通过 | 通过 |
+| `cargo check` | `list_fonts` 后端命令 | 编译检查通过 | 通过 | 通过 |
+| `npm run tauri -- info` | 字体搜索修复后 | Tauri 环境检测通过 | 通过 | 通过 |
+| `npm run tauri dev` | 字体搜索修复后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -73,12 +95,13 @@
 | 2026-09-10 | 上一版自研 Tauri 终端功能不全 | 1 | 改用 xterm.js 作为终端核心 |
 | 2026-09-10 | xterm CSS side-effect import 缺 Vite 类型声明 | 1 | 新增 `src/vite-env.d.ts` |
 | 2026-09-10 | npm install 需要写用户 npm cache，被沙箱拒绝 | 1 | 使用授权后的 `npm install @xterm/xterm @xterm/addon-fit` |
+| 2026-09-10 | 字体搜索范围太少且原生下拉滚动条不匹配主题 | 1 | 后端枚举系统字体，前端自绘搜索下拉和主题滚动条 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
 | 我在哪里？ | 完成 |
-| 我要去哪里？ | 等待用户实机验证 |
+| 我要去哪里？ | 等待用户实机验证字体搜索和串口设备 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

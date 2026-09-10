@@ -26,12 +26,15 @@ interface SerialErrorPayload {
 
 interface AppState {
   ports: string[];
+  availableFonts: string[];
   config: SerialConfig;
   mode: ConnectionMode;
   rxBytes: number;
   txBytes: number;
   lastError: string;
   fontFamily: string;
+  fontQuery: string;
+  fontDropdownOpen: boolean;
   fontSize: number;
   lineSpacing: number;
 }
@@ -54,7 +57,7 @@ const baudRates = [
   2000000, 3000000, 4000000,
 ];
 
-const fontFamilies = [
+const fallbackFontFamilies = [
   "Cascadia Mono",
   "Cascadia Code",
   "JetBrains Mono",
@@ -68,6 +71,7 @@ const storageKey = "serial-terminal-settings-v1";
 const savedSettings = readSavedSettings();
 const state: AppState = {
   ports: [],
+  availableFonts: mergeFonts([]),
   config: {
     port_name: savedSettings.config?.port_name ?? "",
     baud_rate: savedSettings.config?.baud_rate ?? 1500000,
@@ -79,7 +83,9 @@ const state: AppState = {
   rxBytes: 0,
   txBytes: 0,
   lastError: "",
-  fontFamily: savedSettings.fontFamily ?? fontFamilies[0],
+  fontFamily: savedSettings.fontFamily ?? fallbackFontFamilies[0],
+  fontQuery: "",
+  fontDropdownOpen: false,
   fontSize: savedSettings.fontSize ?? 18,
   lineSpacing: savedSettings.lineSpacing ?? 1,
 };
@@ -241,17 +247,7 @@ function renderApp(): void {
             <div class="section-title">终端显示</div>
             <label class="field">
               <span>字体</span>
-              <select id="font-select">
-                ${fontFamilies
-                  .map(
-                    (font) =>
-                      `<option value="${escapeAttribute(font)}"${selectedAttr(
-                        font,
-                        state.fontFamily,
-                      )}>${escapeHtml(font)}</option>`,
-                  )
-                  .join("")}
-              </select>
+              ${renderFontPicker()}
             </label>
             <label class="field range-field">
               <span>字号</span>
@@ -356,12 +352,7 @@ function bindChromeEvents(): void {
     });
   });
 
-  const fontSelect = document.querySelector<HTMLSelectElement>("#font-select");
-  fontSelect?.addEventListener("change", () => {
-    state.fontFamily = fontSelect.value;
-    saveSettings();
-    applyTerminalOptions();
-  });
+  bindFontPickerEvents();
 
   const fontSize = document.querySelector<HTMLInputElement>("#font-size");
   fontSize?.addEventListener("input", () => {
@@ -419,6 +410,134 @@ function renderSegment(
   `;
 }
 
+function renderFontPicker(): string {
+  return `
+    <div class="font-combobox">
+      <button id="font-picker-button" class="font-picker-button" type="button" aria-haspopup="listbox" aria-expanded="${
+        state.fontDropdownOpen ? "true" : "false"
+      }">
+        <span>${escapeHtml(state.fontFamily)}</span>
+        <span class="font-picker-chevron">▼</span>
+      </button>
+      ${
+        state.fontDropdownOpen
+          ? `<div class="font-menu">
+              <input id="font-search" class="font-search" type="search" placeholder="搜索字体" value="${escapeAttribute(
+                state.fontQuery,
+              )}" />
+              <div id="font-options" class="font-options" role="listbox">
+                ${renderFontOptions()}
+              </div>
+            </div>`
+          : ""
+      }
+    </div>
+  `;
+}
+
+function renderFontOptions(): string {
+  const fonts = filteredFonts();
+  if (fonts.length === 0) {
+    return `<div class="font-empty">没有匹配的字体</div>`;
+  }
+
+  return fonts
+    .map(
+      (font) =>
+        `<button type="button" class="font-option${
+          font === state.fontFamily ? " active" : ""
+        }" data-font="${escapeAttribute(font)}" role="option" aria-selected="${
+          font === state.fontFamily ? "true" : "false"
+        }">
+          <span>${escapeHtml(font)}</span>
+        </button>`,
+    )
+    .join("");
+}
+
+function bindFontPickerEvents(): void {
+  const button = document.querySelector<HTMLButtonElement>("#font-picker-button");
+  button?.addEventListener("click", () => {
+    state.fontDropdownOpen = !state.fontDropdownOpen;
+    if (state.fontDropdownOpen) {
+      state.fontQuery = "";
+    }
+    renderApp();
+    focusFontSearch();
+  });
+
+  const search = document.querySelector<HTMLInputElement>("#font-search");
+  search?.addEventListener("input", () => {
+    state.fontQuery = search.value;
+    renderFontOptionList();
+  });
+  search?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      state.fontDropdownOpen = false;
+      renderApp();
+      return;
+    }
+
+    if (event.key === "Enter") {
+      const firstFont = filteredFonts()[0];
+      if (firstFont) {
+        selectFont(firstFont);
+      }
+    }
+  });
+
+  bindFontOptionButtons();
+}
+
+function renderFontOptionList(): void {
+  const list = document.querySelector<HTMLDivElement>("#font-options");
+  if (!list) {
+    return;
+  }
+
+  list.innerHTML = renderFontOptions();
+  bindFontOptionButtons();
+}
+
+function bindFontOptionButtons(): void {
+  document.querySelectorAll<HTMLButtonElement>(".font-option").forEach((button) => {
+    button.addEventListener("click", () => {
+      const font = button.dataset.font;
+      if (font) {
+        selectFont(font);
+      }
+    });
+  });
+}
+
+function selectFont(font: string): void {
+  state.fontFamily = font;
+  state.fontDropdownOpen = false;
+  state.fontQuery = "";
+  state.availableFonts = mergeFonts([font, ...state.availableFonts]);
+  saveSettings();
+  applyTerminalOptions();
+  renderApp();
+}
+
+function filteredFonts(): string[] {
+  const query = state.fontQuery.trim().toLocaleLowerCase();
+  const fonts = mergeFonts([state.fontFamily, ...state.availableFonts]);
+  if (query.length === 0) {
+    return fonts;
+  }
+
+  return fonts.filter((font) => font.toLocaleLowerCase().includes(query));
+}
+
+function focusFontSearch(): void {
+  requestAnimationFrame(() => {
+    const search = document.querySelector<HTMLInputElement>("#font-search");
+    search?.focus();
+    search?.select();
+  });
+}
+
 function applySerialSetting(setting: string, value: string): void {
   if (state.mode === "connected" || state.mode === "connecting") {
     return;
@@ -455,6 +574,17 @@ async function refreshPorts(): Promise<void> {
     state.lastError = "";
   } catch (error) {
     state.lastError = toMessage(error);
+  }
+
+  renderApp();
+}
+
+async function refreshFonts(): Promise<void> {
+  try {
+    const fonts = await invoke<string[]>("list_fonts");
+    state.availableFonts = mergeFonts([state.fontFamily, ...fonts]);
+  } catch {
+    state.availableFonts = mergeFonts([state.fontFamily]);
   }
 
   renderApp();
@@ -586,6 +716,33 @@ function terminalFontFamily(): string {
   return `${state.fontFamily}, "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace`;
 }
 
+function mergeFonts(fonts: string[]): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+
+  for (const font of [...fallbackFontFamilies, ...fonts]) {
+    const value = font.trim();
+    if (value.length === 0) {
+      continue;
+    }
+
+    const key = value.toLocaleLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    merged.push(value);
+  }
+
+  return merged.sort((a, b) =>
+    a.localeCompare(b, "zh-Hans", {
+      numeric: true,
+      sensitivity: "base",
+    }),
+  );
+}
+
 function readSavedSettings(): SavedSettings {
   try {
     const raw = localStorage.getItem(storageKey);
@@ -617,7 +774,7 @@ function normalizeSavedSettings(value: SavedSettings): SavedSettings {
     fontFamily:
       typeof value.fontFamily === "string" && value.fontFamily.length > 0
         ? value.fontFamily
-        : fontFamilies[0],
+        : fallbackFontFamilies[0],
     fontSize:
       typeof value.fontSize === "number" && Number.isFinite(value.fontSize)
         ? Math.min(34, Math.max(12, value.fontSize))
@@ -733,7 +890,22 @@ window.addEventListener("resize", () => {
   queueFit();
 });
 
+document.addEventListener("pointerdown", (event) => {
+  if (!state.fontDropdownOpen) {
+    return;
+  }
+
+  const target = event.target;
+  if (target instanceof Element && target.closest(".font-combobox")) {
+    return;
+  }
+
+  state.fontDropdownOpen = false;
+  renderApp();
+});
+
 updateScale();
 renderApp();
 void setupBackendListeners();
+void refreshFonts();
 void refreshPorts();

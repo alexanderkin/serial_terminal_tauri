@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serialport::{DataBits, Parity, SerialPort, StopBits};
 use std::{
+    collections::BTreeSet,
     io::{ErrorKind, Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -42,6 +43,11 @@ struct SerialData {
 #[derive(Clone, Debug, Serialize)]
 struct SerialError {
     message: String,
+}
+
+#[tauri::command]
+fn list_fonts() -> Result<Vec<String>, String> {
+    Ok(enumerate_fonts())
 }
 
 #[tauri::command]
@@ -201,13 +207,81 @@ fn map_stop_bits(value: u8) -> Result<StopBits, String> {
     }
 }
 
+#[cfg(windows)]
+fn enumerate_fonts() -> Vec<String> {
+    use winreg::{
+        enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ},
+        RegKey,
+    };
+
+    let mut fonts = default_fonts();
+    let registry_paths = [
+        (
+            HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+        ),
+    ];
+
+    for (root, path) in registry_paths {
+        let key = RegKey::predef(root);
+        if let Ok(fonts_key) = key.open_subkey_with_flags(path, KEY_READ) {
+            for value in fonts_key.enum_values().flatten() {
+                for family in font_families_from_registry_name(&value.0) {
+                    fonts.insert(family);
+                }
+            }
+        }
+    }
+
+    fonts.into_iter().collect()
+}
+
+#[cfg(not(windows))]
+fn enumerate_fonts() -> Vec<String> {
+    default_fonts().into_iter().collect()
+}
+
+fn default_fonts() -> BTreeSet<String> {
+    [
+        "Cascadia Mono",
+        "Cascadia Code",
+        "Consolas",
+        "JetBrains Mono",
+        "JetBrainsMonoNerdFontMono-Regular",
+        "Microsoft YaHei UI",
+        "Microsoft YaHei",
+        "SimHei",
+        "monospace",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn font_families_from_registry_name(name: &str) -> Vec<String> {
+    let base = name.split(" (").next().unwrap_or(name);
+    base.split(" & ")
+        .flat_map(|part| {
+            part.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .filter(|value| !value.starts_with('@'))
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(SerialManager::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            list_ports, connect, disconnect, write_text
+            list_fonts, list_ports, connect, disconnect, write_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

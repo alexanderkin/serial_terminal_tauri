@@ -260,7 +260,9 @@ select {
 
 select:focus,
 input:focus,
-button:focus-visible {
+button:focus-visible,
+.font-search:focus,
+.font-picker-button:focus-visible {
   border-color: var(--accent);
 }
 
@@ -343,6 +345,130 @@ button:focus-visible {
   grid-template-columns: minmax(0, 1fr) clamp(42px, calc(54px * var(--ui-scale)), 54px);
   gap: calc(12px * var(--ui-scale));
   align-items: center;
+}
+
+.font-combobox {
+  position: relative;
+  min-width: 0;
+}
+
+.font-picker-button {
+  width: 100%;
+  min-width: 0;
+  height: clamp(30px, calc(40px * var(--ui-scale)), 40px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: calc(8px * var(--ui-scale));
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: 0;
+  padding: 0 calc(12px * var(--ui-scale));
+  background: var(--panel-soft);
+  color: #e8e8e8;
+  font-size: clamp(10px, calc(14px * var(--ui-scale)), 14px);
+  text-align: left;
+}
+
+.font-picker-button span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.font-picker-chevron {
+  color: var(--muted);
+  font-size: clamp(8px, calc(10px * var(--ui-scale)), 10px);
+}
+
+.font-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #191919;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+
+.font-search {
+  width: 100%;
+  height: clamp(30px, calc(38px * var(--ui-scale)), 38px);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  outline: 0;
+  padding: 0 calc(12px * var(--ui-scale));
+  background: #202020;
+  color: var(--text);
+  font-size: clamp(10px, calc(13px * var(--ui-scale)), 13px);
+}
+
+.font-search::placeholder {
+  color: #777777;
+}
+
+.font-options {
+  max-height: clamp(140px, calc(230px * var(--ui-scale)), 260px);
+  overflow-y: auto;
+  padding: calc(4px * var(--ui-scale));
+  scrollbar-color: var(--accent) #161616;
+  scrollbar-width: thin;
+}
+
+.font-options::-webkit-scrollbar {
+  width: calc(10px * var(--ui-scale));
+}
+
+.font-options::-webkit-scrollbar-track {
+  background: #161616;
+}
+
+.font-options::-webkit-scrollbar-thumb {
+  border: 2px solid #161616;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.font-options::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-strong);
+}
+
+.font-option {
+  width: 100%;
+  min-width: 0;
+  height: clamp(28px, calc(34px * var(--ui-scale)), 34px);
+  display: flex;
+  align-items: center;
+  border: 0;
+  border-radius: 5px;
+  padding: 0 calc(10px * var(--ui-scale));
+  background: transparent;
+  color: #dedede;
+  font-size: clamp(10px, calc(13px * var(--ui-scale)), 13px);
+  text-align: left;
+}
+
+.font-option span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.font-option:hover,
+.font-option.active {
+  background: rgba(0, 120, 212, 0.28);
+  color: #ffffff;
+}
+
+.font-empty {
+  padding: calc(14px * var(--ui-scale)) calc(10px * var(--ui-scale));
+  color: var(--muted);
+  font-size: clamp(10px, calc(12px * var(--ui-scale)), 12px);
 }
 
 input[type="range"] {
