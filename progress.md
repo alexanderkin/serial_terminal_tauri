@@ -153,6 +153,28 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 11：替换终端库
+- **状态：** complete
+- 执行的操作：
+  - 读取用户反馈，确认 WebGL xterm 方案仍卡，本轮不再继续局部优化 xterm。
+  - 选择 `ghostty-web` 作为新的终端核心，使用 Ghostty WASM parser 和 canvas renderer。
+  - 安装 `ghostty-web`，卸载 `@xterm/xterm`、`@xterm/addon-fit`、`@xterm/addon-webgl`。
+  - 将前端终端导入切换到 `ghostty-web`，增加 `await init()`。
+  - 删除旧 WebGL addon 激活、context loss 回退和 xterm 内部 CSS。
+  - 改用持久化 `.terminal-surface` 承载 Ghostty canvas/textarea，避免 UI 重渲染时重复 `open()` 或嵌套旧 host。
+  - 按 `ghostty-web` 键盘拦截语义修正 Ctrl+C 有选区复制逻辑。
+  - 保留行距滑块，使用 Ghostty renderer metrics 兼容实现，避免留下失效控件。
+  - 运行前端构建、Rust 格式化/检查、Tauri info 和 Tauri dev 启动验证。
+  - 准备提交到 `serial_terminal` 子仓库。
+- 创建/修改的文件：
+  - `package.json`
+  - `package-lock.json`
+  - `src/main.ts`
+  - `src/styles.css`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -183,6 +205,11 @@
 | `cargo check` | WebGL 终端渲染器后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run tauri -- info` | WebGL 终端渲染器后 | Tauri 环境检测通过 | 通过 | 通过 |
 | `npm run tauri dev` | WebGL 终端渲染器后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功并保持运行 10 秒，手动 Ctrl+C 停止；仅有 MSVC linker stdout 警告 | 通过 |
+| `npm run build` | Ghostty 终端替换后 | TypeScript/Vite 构建通过 | 构建通过；Vite 提示 chunk 大小超过 500 kB | 通过 |
+| `cargo fmt` | Ghostty 终端替换后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `cargo check` | Ghostty 终端替换后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run tauri -- info` | Ghostty 终端替换后 | Tauri 环境检测通过 | 通过 | 通过 |
+| `npm run tauri dev` | Ghostty 终端替换后 | 启动到 Tauri exe 且无立即崩溃 | 两次启动均成功，最后一次保持运行 10 秒后停止；仅有 MSVC linker stdout 警告 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -196,12 +223,13 @@
 | 2026-09-10 | 删除仍比较卡，自绘下拉不需要搜索 | 1 | 移除 picker 搜索路径，后端同步写改为 channel + writer 线程 |
 | 2026-09-10 | 终端右键菜单不符合主题，输入仍卡 | 1 | 改为主题自绘菜单，并继续优化真实串口输入/渲染链路 |
 | 2026-09-10 | 连续输入/删除仍卡，怀疑终端本身 | 1 | 切换 xterm 官方 WebGL renderer，并将 RX 改为字节流直接写入 xterm |
+| 2026-09-10 | WebGL xterm 仍卡，用户要求换终端 | 1 | 替换为 `ghostty-web` 并清理 xterm/WebGL 残留 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 10：终端渲染器性能修复 |
-| 我要去哪里？ | 等待用户实机验证 WebGL renderer 下连续输入/删除手感 |
+| 我在哪里？ | 完成阶段 11：替换终端库 |
+| 我要去哪里？ | 等待用户实机验证 Ghostty 终端下连续输入/删除手感 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

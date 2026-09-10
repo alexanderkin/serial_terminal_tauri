@@ -1,10 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FitAddon } from "@xterm/addon-fit";
-import { WebglAddon } from "@xterm/addon-webgl";
-import { Terminal } from "@xterm/xterm";
-import "@xterm/xterm/css/xterm.css";
+import { FitAddon, init, Terminal } from "ghostty-web";
 
 type ConnectionMode = "disconnected" | "connecting" | "connected" | "error";
 type Parity = "none" | "even" | "odd";
@@ -33,6 +30,31 @@ interface TerminalContextMenuState {
   top: number;
   canCopy: boolean;
   canPaste: boolean;
+}
+
+interface GhosttyRendererMetrics {
+  width: number;
+  height: number;
+  baseline: number;
+}
+
+interface GhosttyRendererInternals {
+  metrics: GhosttyRendererMetrics;
+  getMetrics(): GhosttyRendererMetrics;
+  remeasureFont(): void;
+  resize(cols: number, rows: number): void;
+  render(
+    buffer: unknown,
+    forceAll?: boolean,
+    viewportY?: number,
+    scrollbackProvider?: unknown,
+  ): void;
+}
+
+interface GhosttyTerminalInternals {
+  renderer?: GhosttyRendererInternals;
+  wasmTerm?: unknown;
+  viewportY: number;
 }
 
 interface SerialConfig {
@@ -133,28 +155,18 @@ if (!appRoot) {
 const app: HTMLDivElement = appRoot;
 const currentWindow = getCurrentWindow();
 
+await init();
+
 const fitAddon = new FitAddon();
 const terminal = new Terminal({
-  allowProposedApi: false,
   allowTransparency: false,
-  altClickMovesCursor: false,
   convertEol: false,
-  customGlyphs: true,
   cursorBlink: true,
   cursorStyle: "bar",
   disableStdin: false,
-  drawBoldTextInBrightColors: false,
   fontFamily: terminalFontFamily(),
   fontSize: state.fontSize,
-  ignoreBracketedPasteMode: true,
-  letterSpacing: 0,
-  lineHeight: state.lineSpacing,
-  minimumContrastRatio: 1,
-  rescaleOverlappingGlyphs: true,
-  rightClickSelectsWord: false,
-  screenReaderMode: false,
   scrollback: 10000,
-  scrollOnUserInput: true,
   smoothScrollDuration: 0,
   theme: {
     background: "#050505",
@@ -186,17 +198,16 @@ terminal.attachCustomKeyEventHandler((event) => {
   if (event.type === "keydown" && event.ctrlKey && event.key.toLowerCase() === "c") {
     if (terminal.hasSelection()) {
       copySelection(true);
-      return false;
+      return true;
     }
   }
 
-  return true;
+  return false;
 });
 
 let terminalHost: HTMLDivElement | null = null;
+let terminalSurface: HTMLDivElement | null = null;
 let terminalInputDisposable: { dispose(): void } | null = null;
-let webglAddon: WebglAddon | null = null;
-let webglContextLossDisposable: { dispose(): void } | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let fitQueued = false;
 let pendingSerialText = "";
@@ -355,57 +366,42 @@ function renderApp(): void {
 
 function attachTerminal(): void {
   const host = document.querySelector<HTMLDivElement>("#terminal-host");
-  if (!host || host === terminalHost) {
+  if (!host) {
     return;
   }
 
-  terminalHost = host;
-  if (terminal.element) {
-    host.replaceChildren(terminal.element);
-  } else {
-    terminal.open(host);
+  if (!terminalSurface) {
+    terminalSurface = document.createElement("div");
+    terminalSurface.className = "terminal-surface";
+    terminal.open(terminalSurface);
+    applyTerminalLineSpacing();
   }
-  activateWebglRenderer();
+
+  if (host !== terminalHost || terminalSurface.parentElement !== host) {
+    host.replaceChildren(terminalSurface);
+    terminalHost = host;
+
+    resizeObserver?.disconnect();
+    resizeObserver = new ResizeObserver(() => {
+      queueFit();
+    });
+    resizeObserver.observe(host);
+
+    host.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openTerminalContextMenu(event.clientX, event.clientY);
+    }, { capture: true });
+  }
+
+  if (!terminalInputDisposable) {
+    terminalInputDisposable = terminal.onData((data) => {
+      queueSerialText(normalizeTerminalInput(data));
+    });
+  }
+
   terminal.focus();
   queueFit();
-
-  resizeObserver?.disconnect();
-  resizeObserver = new ResizeObserver(() => {
-    queueFit();
-  });
-  resizeObserver.observe(host);
-
-  terminalInputDisposable?.dispose();
-  terminalInputDisposable = terminal.onData((data) => {
-    queueSerialText(normalizeTerminalInput(data));
-  });
-
-  host.addEventListener("contextmenu", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    openTerminalContextMenu(event.clientX, event.clientY);
-  }, { capture: true });
-}
-
-function activateWebglRenderer(): void {
-  if (webglAddon || !terminal.element) {
-    return;
-  }
-
-  try {
-    const addon = new WebglAddon();
-    webglContextLossDisposable = addon.onContextLoss(() => {
-      webglContextLossDisposable?.dispose();
-      webglContextLossDisposable = null;
-      webglAddon?.dispose();
-      webglAddon = null;
-      terminal.refresh(0, terminal.rows - 1);
-    });
-    terminal.loadAddon(addon);
-    webglAddon = addon;
-  } catch (error) {
-    console.warn("WebGL terminal renderer is unavailable, falling back to DOM renderer.", error);
-  }
 }
 
 function bindChromeEvents(): void {
@@ -853,10 +849,36 @@ function applySerialSetting(setting: string, value: string): void {
 function applyTerminalOptions(): void {
   terminal.options.fontFamily = terminalFontFamily();
   terminal.options.fontSize = state.fontSize;
-  terminal.options.lineHeight = state.lineSpacing;
-  webglAddon?.clearTextureAtlas();
+  applyTerminalLineSpacing();
   queueFit();
   terminal.focus();
+}
+
+function applyTerminalLineSpacing(): void {
+  const internals = terminal as unknown as GhosttyTerminalInternals;
+  const renderer = internals.renderer;
+  if (!renderer) {
+    return;
+  }
+
+  renderer.remeasureFont();
+  const baseMetrics = renderer.getMetrics();
+  const rowHeight = Math.max(
+    baseMetrics.height,
+    Math.ceil(baseMetrics.height * state.lineSpacing),
+  );
+  const extraHeight = rowHeight - baseMetrics.height;
+
+  // ghostty-web does not expose lineHeight; keep FitAddon, selection and rendering on one metric.
+  renderer.metrics = {
+    ...baseMetrics,
+    height: rowHeight,
+    baseline: baseMetrics.baseline + Math.floor(extraHeight / 2),
+  };
+  renderer.resize(terminal.cols, terminal.rows);
+  if (internals.wasmTerm) {
+    renderer.render(internals.wasmTerm, true, internals.viewportY, terminal);
+  }
 }
 
 async function refreshPorts(): Promise<void> {
@@ -1059,7 +1081,7 @@ function queueFit(): void {
     try {
       fitAddon.fit();
     } catch {
-      // The fit addon can run before xterm has completed its first layout pass.
+      // The fit addon can run before the terminal has completed its first layout pass.
     }
   });
 }

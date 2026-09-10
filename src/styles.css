@@ -689,6 +689,7 @@ output {
 }
 
 .terminal-host {
+  position: relative;
   width: 100%;
   height: 100%;
   background: var(--terminal);
@@ -696,25 +697,20 @@ output {
   outline: 0;
 }
 
-.terminal-host .xterm {
+.terminal-surface {
+  position: relative;
   width: 100%;
   height: 100%;
+  overflow: hidden;
+  background: var(--terminal);
+  caret-color: transparent;
   contain: strict;
+  outline: 0;
 }
 
-.terminal-host .xterm-viewport {
-  background: transparent !important;
-  scrollbar-color: #7b7b7b transparent;
-  scrollbar-width: thin;
-}
-
-.terminal-host .xterm-screen {
-  width: 100% !important;
-  transform: translateZ(0);
-}
-
-.terminal-host .xterm-rows {
-  font-variant-ligatures: none;
+.terminal-surface canvas {
+  display: block;
+  background: var(--terminal);
 }
 
 @media (max-width: 940px) {

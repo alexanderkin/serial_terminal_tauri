@@ -6,7 +6,7 @@
 
 ## 下一步
 
-等待用户实机验证 WebGL 终端渲染器下连续输入/删除手感。
+Ghostty 终端替换已完成，等待用户实机验证连续输入/删除手感。
 
 ## 当前阶段
 
@@ -88,6 +88,17 @@
 - [x] 提交到 `serial_terminal` 子仓库
 - **状态：** complete
 
+### 阶段 11：替换终端库
+- [x] 调研并选择新的终端实现替代 xterm.js
+- [x] 安装并接入 `ghostty-web`
+- [x] 删除 xterm/WebGL addon 依赖和残留代码
+- [x] 按 Ghostty 的 `open(element)` 语义改为持久化终端 surface 挂载
+- [x] 按 Ghostty 的键盘拦截语义修正 Ctrl+C 选区复制
+- [x] 保留行距滑块，使用 Ghostty renderer metrics 兼容实现
+- [x] Rust/Tauri 验证
+- [x] 提交到 `serial_terminal` 子仓库
+- **状态：** complete
+
 ## 关键问题
 
 1. 终端核心必须使用成熟库处理 ANSI、IME、宽字符、滚动缓冲和选择，不能继续手写简化版。
@@ -111,6 +122,7 @@
 | 不恢复本地输入预览 | 用户已经明确要求撤销该方向，后续卡顿优化必须集中在真实串口发送、接收渲染和统计更新链路 |
 | 使用 xterm 官方 WebGL renderer | 当前主包默认 DOM renderer 是可靠 fallback，但高频回显和满屏更新性能弱；WebGL renderer 是 xterm 官方性能路径 |
 | RX 直接向 xterm 写入 `Uint8Array` | 避免 JS `TextDecoder` 和字符串拼接，把流式 UTF-8 解码交给 xterm 的输入解析器 |
+| 换用 `ghostty-web` | 用户实测 WebGL xterm 仍卡，需要替换完整终端核心；`ghostty-web` 提供 Ghostty WASM parser 和 canvas renderer，同时保留接近 xterm 的 API，迁移风险低于重写 |
 
 ## 遇到的错误
 
@@ -123,6 +135,7 @@
 | 删除仍比较卡、自绘下拉不需要搜索 | 1 | 移除下拉搜索；后端写入改为异步队列和后台 writer 线程 |
 | 终端右键菜单不符合主题且输入仍卡 | 1 | 新增主题自绘菜单；继续优化真实串口链路，不使用本地输入预览 |
 | 连续输入/删除仍卡，怀疑终端本身 | 1 | 切换 xterm 官方 WebGL renderer，并改为字节流直接写入终端 |
+| WebGL xterm 仍卡，用户要求换终端 | 1 | 切换到 `ghostty-web`，删除 xterm/WebGL 依赖，并按新库语义重做终端挂载 |
 
 ## 提交
 

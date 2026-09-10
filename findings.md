@@ -10,6 +10,7 @@
 - 用户进一步确认自绘下拉不需要搜索；连续删除仍比较卡，需要继续优化同步写入路径。
 - 终端区域右键菜单需要匹配应用主题色，输入/删除仍需继续优化，但不能使用此前被回滚的本地输入预览方案。
 - 连续输入和删除仍卡，用户判断是终端问题；允许在必要时换一种终端。
+- WebGL xterm 方案实机仍卡，用户明确要求“换终端”。
 
 ## 研究发现
 - 当前 Tauri 版前端终端是自研文本渲染，天然缺少完整 ANSI、IME、宽字符、滚动缓冲、选择和 resize 语义。
@@ -30,6 +31,10 @@
 - 本地此前没有 `@xterm/addon-webgl`；xterm README 将 WebGL addon 描述为 GPU 加速 renderer，插件需要单独安装。
 - xterm public API 支持 `terminal.write(string | Uint8Array)`，因此串口 RX 不需要先在应用层 `TextDecoder` 成 JS 字符串再写入。
 - WebGL renderer 插件有 `onContextLoss` 事件，适合做失败回退，避免 WebGL2 不可用或上下文丢失导致终端不可用。
+- `ghostty-web` 提供基于 Ghostty WASM parser 的终端核心和 canvas renderer，并导出接近 xterm 的 `Terminal`、`FitAddon`、`init` API。
+- `ghostty-web` 的 `Terminal.open(parent)` 会把传入的父元素保存为 `terminal.element` 并在里面追加 canvas/textarea；应用重渲染时不能把 `terminal.element` 当作子节点再挂进新 host，否则会嵌套旧 host。
+- `ghostty-web` 的 `attachCustomKeyEventHandler` 返回值语义是 `true` 表示阻止默认处理；Ctrl+C 有选区时需要返回 `true`，普通输入返回 `false`。
+- `ghostty-web` 构建产物会将 WASM 以内联 data URL 形式打进 Vite bundle，本轮不需要额外复制 `.wasm` 静态资源。
 
 ## 技术决策
 | 决策 | 理由 |
@@ -49,6 +54,8 @@
 | RX 输出和统计更新按动画帧合并 | 降低每包事件造成的 `terminal.write` 与 DOM textContent 更新频率 |
 | 优先切换 xterm 官方 WebGL renderer | 先替换渲染后端，不立刻换完整终端库，能最大程度保留现有功能和 API |
 | RX 输出改为 `Uint8Array` 写入 | 降低 JS 字符串分配/拼接，保留 xterm 的流式 UTF-8 处理 |
+| 替换为 `ghostty-web` | 用户反馈 WebGL xterm 仍卡；Ghostty WASM parser + canvas renderer 能替换完整终端核心，同时继续复用当前串口桥接和 UI 外壳 |
+| 终端 DOM 改用持久化 surface | Ghostty 将 `open()` 入参作为终端根元素，重渲染 UI 时移动这个 surface 比重新 open 或挂载 `terminal.element` 更安全 |
 
 ## 遇到的问题
 | 问题 | 解决方案 |
@@ -63,6 +70,7 @@
 | 右键菜单不符合主题 | 使用固定定位的自绘菜单并按视口夹取位置 |
 | 输入仍比较卡且不能恢复本地预览 | 优化真实链路：前端抢占 flush、RX 帧合并、统计节流、后端 writer 合并小包 |
 | 连续输入/删除仍卡且怀疑终端本身 | 接入 `@xterm/addon-webgl`，使用 GPU renderer；若不可用自动回退 DOM |
+| WebGL xterm 仍卡 | 替换为 `ghostty-web`，清理 xterm/WebGL 依赖和内部 CSS，修正挂载和键盘拦截语义 |
 
 ## 资源
 - 本地 `serial_terminal` Tauri 项目。
@@ -75,6 +83,7 @@
 - 最新问题聚焦终端右键菜单和真实输入链路性能；本轮不采用已被回滚的本地输入预览策略。
 - 主题右键菜单和真实链路优化后，`npm run build`、`cargo check`、`npm run tauri -- info` 与 `npm run tauri dev` 均通过；Rust 命令仍会输出已知路径 canonicalize 警告。
 - 本轮已安装 `@xterm/addon-webgl`，并通过 `npm run build`、`cargo check`、`npm run tauri -- info`、`npm run tauri dev`；Tauri dev 启动后保持运行 10 秒无初始化崩溃。
+- 本轮开始替换为 `ghostty-web`；前端 `npm run build` 已通过，待继续做 Rust/Tauri 启动验证。
 
 ---
 *每执行2次查看/浏览器或搜索操作后更新此文件*
