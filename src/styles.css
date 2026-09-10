@@ -7,12 +7,12 @@
   --border: #333333;
   --text: #e9e9e9;
   --muted: #9a9a9a;
-  --terminal: rgb(30, 30, 46);
+  --terminal: #1e1e2e;
   --accent: #0078d4;
   --accent-strong: #3b78e7;
   --danger: #ff4f4f;
   --success: #26c281;
-  --selection: rgb(88, 91, 112);
+  --selection: #585b70;
   --sidebar-width: clamp(176px, calc(320px * var(--ui-scale)), 320px);
   --window-titlebar-height: 32px;
   --topbar-height: clamp(52px, calc(88px * var(--ui-scale)), 88px);
