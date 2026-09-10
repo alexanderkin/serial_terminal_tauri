@@ -163,6 +163,7 @@ input:disabled {
   background: rgba(255, 79, 79, 0.13);
   color: #ff7979;
   font-size: clamp(10px, calc(13px * var(--ui-scale)), 13px);
+  white-space: nowrap;
 }
 
 .status-pill.connected {

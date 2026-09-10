@@ -640,7 +640,7 @@ async function connectSerial(): Promise<void> {
     state.mode = "connected";
     state.rxBytes = 0;
     state.txBytes = 0;
-    terminal.writeln(`\x1b[32m已连接 ${state.config.port_name} @ ${state.config.baud_rate}\x1b[0m`);
+    terminal.writeln(`\x1b[32m已连接 ${connectionSummaryText()}\x1b[0m`);
   } catch (error) {
     state.mode = "error";
     state.lastError = toMessage(error);
@@ -888,7 +888,7 @@ function statusTone(): string {
 
 function statusText(): string {
   if (state.mode === "connected") {
-    return "已连接";
+    return `已连接 ${connectionSummaryText()}`;
   }
   if (state.mode === "connecting") {
     return "连接中";
@@ -911,12 +911,30 @@ function connectionButtonText(): string {
 
 function connectionDetailText(): string {
   if (state.mode === "connected") {
-    return `${state.config.port_name} · ${state.config.baud_rate}`;
+    return connectionSummaryText();
   }
   if (state.mode === "connecting") {
     return "正在建立连接";
   }
   return "未连接";
+}
+
+function connectionSummaryText(): string {
+  return `${state.config.port_name} · ${state.config.baud_rate} · ${serialProfileText()}`;
+}
+
+function serialProfileText(): string {
+  return `${state.config.data_bits}${parityLabel(state.config.parity)}${state.config.stop_bits}`;
+}
+
+function parityLabel(parity: Parity): string {
+  if (parity === "even") {
+    return "E";
+  }
+  if (parity === "odd") {
+    return "O";
+  }
+  return "N";
 }
 
 function formatBytes(bytes: number): string {
