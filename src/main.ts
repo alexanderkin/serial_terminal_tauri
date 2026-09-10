@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -7,6 +8,15 @@ import "@xterm/xterm/css/xterm.css";
 type ConnectionMode = "disconnected" | "connecting" | "connected" | "error";
 type Parity = "none" | "even" | "odd";
 type PickerId = "port" | "baud" | "font";
+type ResizeDirection =
+  | "North"
+  | "South"
+  | "East"
+  | "West"
+  | "NorthEast"
+  | "NorthWest"
+  | "SouthEast"
+  | "SouthWest";
 
 interface DropdownPosition {
   left: number;
@@ -109,6 +119,7 @@ if (!appRoot) {
   throw new Error("Missing #app root");
 }
 const app: HTMLDivElement = appRoot;
+const currentWindow = getCurrentWindow();
 
 const serialDecoder = new TextDecoder("utf-8");
 const fitAddon = new FitAddon();
@@ -173,6 +184,27 @@ function renderApp(): void {
 
   app.innerHTML = `
     <div class="app-shell">
+      <div class="resize-handle resize-handle-n" data-resize-direction="North"></div>
+      <div class="resize-handle resize-handle-s" data-resize-direction="South"></div>
+      <div class="resize-handle resize-handle-e" data-resize-direction="East"></div>
+      <div class="resize-handle resize-handle-w" data-resize-direction="West"></div>
+      <div class="resize-handle resize-handle-ne" data-resize-direction="NorthEast"></div>
+      <div class="resize-handle resize-handle-nw" data-resize-direction="NorthWest"></div>
+      <div class="resize-handle resize-handle-se" data-resize-direction="SouthEast"></div>
+      <div class="resize-handle resize-handle-sw" data-resize-direction="SouthWest"></div>
+
+      <div class="window-titlebar">
+        <div class="window-drag-region" data-tauri-drag-region>
+          <span class="window-title-mark"></span>
+          <span class="window-title">Serial Terminal</span>
+        </div>
+        <div class="window-controls">
+          <button id="window-minimize" class="window-control" type="button" aria-label="最小化" title="最小化">-</button>
+          <button id="window-maximize" class="window-control" type="button" aria-label="最大化/还原" title="最大化/还原">□</button>
+          <button id="window-close" class="window-control close" type="button" aria-label="关闭" title="关闭">×</button>
+        </div>
+      </div>
+
       <header class="topbar">
         <div class="brand">
           <div class="brand-title">Serial Terminal</div>
@@ -319,6 +351,8 @@ function attachTerminal(): void {
 }
 
 function bindChromeEvents(): void {
+  bindWindowChromeEvents();
+
   document.querySelector("#refresh-ports")?.addEventListener("click", () => {
     void refreshPorts();
   });
@@ -362,6 +396,40 @@ function bindChromeEvents(): void {
     updateOutput("#line-spacing-output", state.lineSpacing.toFixed(2));
     saveSettings();
     applyTerminalOptions();
+  });
+}
+
+function bindWindowChromeEvents(): void {
+  document.querySelector("#window-minimize")?.addEventListener("click", () => {
+    void currentWindow.minimize();
+  });
+
+  document.querySelector("#window-maximize")?.addEventListener("click", () => {
+    void currentWindow.toggleMaximize();
+  });
+
+  document.querySelector("#window-close")?.addEventListener("click", () => {
+    void currentWindow.close();
+  });
+
+  document.querySelector(".window-drag-region")?.addEventListener("dblclick", () => {
+    void currentWindow.toggleMaximize();
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-resize-direction]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+
+      const direction = handle.dataset.resizeDirection as ResizeDirection | undefined;
+      if (!direction) {
+        return;
+      }
+
+      event.preventDefault();
+      void currentWindow.startResizeDragging(direction);
+    });
   });
 }
 
