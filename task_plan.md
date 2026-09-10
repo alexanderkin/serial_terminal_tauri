@@ -6,7 +6,7 @@
 
 ## 下一步
 
-删除和快速输入成块问题已按发送链路修复，等待用户实机复测连续删除和快速输入手感。
+xterm.js 分支已完成回切，等待用户在 `codex/xterm-js` 分支实机 A/B 测试。
 
 ## 当前阶段
 
@@ -126,6 +126,16 @@
 - [x] 构建、Rust 格式化/检查和 Tauri info 验证
 - **状态：** complete
 
+### 阶段 15：分支回切普通 xterm.js
+- [x] 从当前稳定 master 新建 `codex/xterm-js` 分支
+- [x] 卸载 `ghostty-web`，安装 `@xterm/xterm` 和 `@xterm/addon-fit`
+- [x] 前端终端核心切回 xterm.js，保留低延迟 TX/RX 串口链路
+- [x] 修正 Ctrl+C 有选区时的 xterm 键盘处理返回语义
+- [x] 行距改用 xterm 原生 `lineHeight`
+- [x] 样式改回 xterm DOM 结构和 viewport 滚动条
+- [x] 构建、Rust 检查、Tauri info 和 Tauri dev 启动验证
+- **状态：** complete
+
 ## 关键问题
 
 1. 终端核心必须使用成熟库处理 ANSI、IME、宽字符、滚动缓冲和选择，不能继续手写简化版。
@@ -154,6 +164,7 @@
 | Backspace/Delete 不再立即 flush | 连续删除对实时性敏感但不应每个键一次 invoke；40ms 合并可明显降低 IPC 数量 |
 | 串口 RX 走低延迟路径 | 直接 COM5 测试证明硬件可一行一行返回，应用不应再用 50ms 大读缓冲和前端 rAF 合并把多行攒成一段 |
 | 串口 TX 走低延迟路径 | 删除和快速输入是交互输入，不能再用 40ms debounce 或 writer drain 把按键合并成块 |
+| 用分支验证 xterm.js | 主线保留稳定状态，单独在 `codex/xterm-js` 分支 A/B 测试普通 xterm.js |
 
 ## 遇到的错误
 
@@ -170,6 +181,7 @@
 | Ghostty 后连续输入/删除仍卡 | 1 | 用 CDP 和真实 COM5 输入链路定位到 `write_text` invoke 抖动与过密 flush；改为有限并发和删除键专用合并窗口 |
 | 按住回车时输出成段刷新 | 1 | 直接 COM5 测试确认硬件逐行返回；改为低延迟 reader 和前端即时写终端 |
 | 删除和快速输入仍成块 | 1 | 移除前端输入 debounce 和后端 writer 小包合并，改为按键级低延迟发送 |
+| 需要验证是否可切回普通 xterm.js | 1 | 在 `codex/xterm-js` 分支回切 xterm.js，保留低延迟串口链路用于实机测试 |
 
 ## 提交
 

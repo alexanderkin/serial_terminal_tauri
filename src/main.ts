@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FitAddon, init, Terminal } from "ghostty-web";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 
 type ConnectionMode = "disconnected" | "connecting" | "connected" | "error";
 type Parity = "none" | "even" | "odd";
@@ -30,31 +32,6 @@ interface TerminalContextMenuState {
   top: number;
   canCopy: boolean;
   canPaste: boolean;
-}
-
-interface GhosttyRendererMetrics {
-  width: number;
-  height: number;
-  baseline: number;
-}
-
-interface GhosttyRendererInternals {
-  metrics: GhosttyRendererMetrics;
-  getMetrics(): GhosttyRendererMetrics;
-  remeasureFont(): void;
-  resize(cols: number, rows: number): void;
-  render(
-    buffer: unknown,
-    forceAll?: boolean,
-    viewportY?: number,
-    scrollbackProvider?: unknown,
-  ): void;
-}
-
-interface GhosttyTerminalInternals {
-  renderer?: GhosttyRendererInternals;
-  wasmTerm?: unknown;
-  viewportY: number;
 }
 
 interface SerialConfig {
@@ -155,8 +132,6 @@ if (!appRoot) {
 const app: HTMLDivElement = appRoot;
 const currentWindow = getCurrentWindow();
 
-await init();
-
 const fitAddon = new FitAddon();
 const terminal = new Terminal({
   allowTransparency: false,
@@ -166,6 +141,8 @@ const terminal = new Terminal({
   disableStdin: false,
   fontFamily: terminalFontFamily(),
   fontSize: state.fontSize,
+  lineHeight: state.lineSpacing,
+  rightClickSelectsWord: false,
   scrollback: 10000,
   smoothScrollDuration: 0,
   theme: {
@@ -198,15 +175,14 @@ terminal.attachCustomKeyEventHandler((event) => {
   if (event.type === "keydown" && event.ctrlKey && event.key.toLowerCase() === "c") {
     if (terminal.hasSelection()) {
       copySelection(true);
-      return true;
+      return false;
     }
   }
 
-  return false;
+  return true;
 });
 
 let terminalHost: HTMLDivElement | null = null;
-let terminalSurface: HTMLDivElement | null = null;
 let terminalInputDisposable: { dispose(): void } | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let fitQueued = false;
@@ -365,15 +341,12 @@ function attachTerminal(): void {
     return;
   }
 
-  if (!terminalSurface) {
-    terminalSurface = document.createElement("div");
-    terminalSurface.className = "terminal-surface";
-    terminal.open(terminalSurface);
-    applyTerminalLineSpacing();
-  }
-
-  if (host !== terminalHost || terminalSurface.parentElement !== host) {
-    host.replaceChildren(terminalSurface);
+  if (host !== terminalHost || terminal.element?.parentElement !== host) {
+    if (terminal.element) {
+      host.replaceChildren(terminal.element);
+    } else {
+      terminal.open(host);
+    }
     terminalHost = host;
 
     resizeObserver?.disconnect();
@@ -843,36 +816,9 @@ function applySerialSetting(setting: string, value: string): void {
 function applyTerminalOptions(): void {
   terminal.options.fontFamily = terminalFontFamily();
   terminal.options.fontSize = state.fontSize;
-  applyTerminalLineSpacing();
+  terminal.options.lineHeight = state.lineSpacing;
   queueFit();
   terminal.focus();
-}
-
-function applyTerminalLineSpacing(): void {
-  const internals = terminal as unknown as GhosttyTerminalInternals;
-  const renderer = internals.renderer;
-  if (!renderer) {
-    return;
-  }
-
-  renderer.remeasureFont();
-  const baseMetrics = renderer.getMetrics();
-  const rowHeight = Math.max(
-    baseMetrics.height,
-    Math.ceil(baseMetrics.height * state.lineSpacing),
-  );
-  const extraHeight = rowHeight - baseMetrics.height;
-
-  // ghostty-web does not expose lineHeight; keep FitAddon, selection and rendering on one metric.
-  renderer.metrics = {
-    ...baseMetrics,
-    height: rowHeight,
-    baseline: baseMetrics.baseline + Math.floor(extraHeight / 2),
-  };
-  renderer.resize(terminal.cols, terminal.rows);
-  if (internals.wasmTerm) {
-    renderer.render(internals.wasmTerm, true, internals.viewportY, terminal);
-  }
 }
 
 async function refreshPorts(): Promise<void> {

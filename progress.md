@@ -227,6 +227,26 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 15：分支回切普通 xterm.js
+- **状态：** complete
+- 执行的操作：
+  - 按用户要求从当前稳定状态创建 `codex/xterm-js` 分支。
+  - 卸载 `ghostty-web`，安装 `@xterm/xterm` 和 `@xterm/addon-fit`。
+  - 将前端 import、终端初始化和样式切回普通 xterm.js。
+  - 移除 Ghostty `init()`、持久化 surface 和 renderer metrics 行距兼容逻辑。
+  - 使用 xterm 原生 `lineHeight` 支持行距滑块。
+  - 修正 xterm `attachCustomKeyEventHandler` 语义：Ctrl+C 有选区复制后返回 `false` 阻止发送中断。
+  - 保留阶段 13/14 的低延迟 RX/TX 串口链路。
+  - 运行前端构建、Rust 检查、Tauri info 和 Tauri dev 启动验证。
+- 创建/修改的文件：
+  - `package.json`
+  - `package-lock.json`
+  - `src/main.ts`
+  - `src/styles.css`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -282,6 +302,10 @@
 | `cargo fmt` | 低延迟 TX 改动后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `cargo check` | 低延迟 TX 改动后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run tauri -- info` | 低延迟 TX 改动后 | Tauri 环境检测通过 | 通过 | 通过 |
+| `npm run build` | xterm.js 分支回切后 | TypeScript/Vite 构建通过 | 构建通过，JS chunk 约 368KB | 通过 |
+| `cargo check` | xterm.js 分支回切后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run tauri -- info` | xterm.js 分支回切后 | Tauri 环境检测通过 | 通过 | 通过 |
+| `npm run tauri dev` | xterm.js 分支回切后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -299,12 +323,13 @@
 | 2026-09-10 | Ghostty 后连续输入/删除仍有卡死反馈 | 1 | 用 CDP 和真实 COM5 分层定位，确认是 `write_text` invoke 抖动被过密 flush 放大；改为删除键专用合并和有限并发写入 |
 | 2026-09-10 | 按住回车时输出成段刷新 | 1 | 直接 COM5 测试证明硬件逐行返回，改为低延迟 reader 和前端即时写终端 |
 | 2026-09-10 | 删除和快速输入仍成块 | 1 | 移除前端输入 debounce 和后端 writer drain，改为按键级低延迟发送 |
+| 2026-09-10 | 需要切回普通 xterm.js 验证 | 1 | 创建 `codex/xterm-js` 分支并回切 xterm.js，保留低延迟串口链路 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 14：删除与快速输入低延迟发送 |
-| 我要去哪里？ | 提交本轮低延迟 TX 修复，并等待用户实机复测 |
+| 我在哪里？ | 完成阶段 15：分支回切普通 xterm.js |
+| 我要去哪里？ | 提交 xterm.js 分支，等待用户实机 A/B 测试 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

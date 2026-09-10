@@ -14,6 +14,7 @@
 - Ghostty 终端替换后仍有卡死/卡顿反馈；用户要求先调试抓证据，再基于证据修改。
 - 按住回车时仍能看到输出成段刷新；期望是一行一行连续刷出。
 - 回车刷新行已解决，但删除和快速输入仍表现为一块一块更新；期望按键级连续反馈。
+- 用户要求利用 git 分支把终端核心切回普通 xterm.js 做验证。
 
 ## 研究发现
 - 当前 Tauri 版前端终端是自研文本渲染，天然缺少完整 ANSI、IME、宽字符、滚动缓冲、选择和 resize 语义。
@@ -50,6 +51,9 @@
 - 删除成块的直接原因之一是 `serialDeleteWriteDelayMs = 40`；这个策略虽然降低 invoke 数量，但会把连续 Backspace 合并成 40ms 一批。
 - 快速输入成块的另一个来源是 Rust writer 线程在每次 `recv` 后继续 `try_recv` drain channel，直到 64KB 上限再 `write_all`，会把短时间内多个按键合成一次串口写入。
 - 后端 `write_text` 命令现在只做 channel 入队和 TX 计数，实际串口写入在后台线程完成；因此前端不再需要用固定 debounce 保护 UI 线程。
+- xterm.js v6 与 `@xterm/addon-fit` 可直接编译通过，生产构建 JS 从 Ghostty 分支约 673KB 降到约 368KB。
+- xterm.js 的 `attachCustomKeyEventHandler` 返回 `false` 表示阻止 xterm 继续处理事件；这与此前 Ghostty 分支记录的语义相反，因此 Ctrl+C 有选区复制时必须返回 `false`。
+- xterm.js 原生支持 `lineHeight` 选项，不需要 Ghostty 分支中直接改 renderer metrics 的兼容逻辑。
 
 ## 技术决策
 | 决策 | 理由 |
@@ -78,6 +82,7 @@
 | RX 到达即写入终端 | 统计 DOM 可以帧级节流，但终端正文不应为省重绘把交互输出攒到下一帧统一写 |
 | TX 到达即尝试发送 | 串口写入已后台化，前端输入应优先保证交互连续性，积压只在 invoke 并发耗尽时发生 |
 | writer 不再 drain 合并小包 | 快速输入/删除需要按键级到达设备，后台线程不应再把多个按键主动合成一次 `write_all` |
+| xterm 分支不引入 WebGL addon | 用户要求普通 xterm.js，本分支只使用 `@xterm/xterm` 和 `@xterm/addon-fit` |
 
 ## 遇到的问题
 | 问题 | 解决方案 |
@@ -96,6 +101,7 @@
 | Ghostty 后仍反馈卡死 | 通过 CDP profile、合成输出、真实 Tauri RX 和真实 COM5 键盘输入分层定位，确认主要瓶颈是 `write_text` 调用密度和 invoke 抖动，而不是终端渲染 |
 | 按住回车输出成段刷新 | 直接 COM5 读写测试显示硬件逐行返回；移除前端 RX rAF 合并，并降低 Rust reader timeout/buffer |
 | 删除和快速输入仍成块 | 移除前端 Backspace/普通输入 debounce；提高 invoke 并发上限；后端 writer 改为每个入队包单独 `write_all` |
+| 切回 xterm.js 需要重新处理键盘语义 | 将 Ctrl+C 选区复制处理改为返回 `false` 阻止 xterm 发送中断 |
 
 ## 资源
 - 本地 `serial_terminal` Tauri 项目。
@@ -112,6 +118,7 @@
 - 本轮已完成证据驱动性能定位；所有临时调试命令和前端 debug API 已移除，最终生产改动仅保留串口发送节流策略。
 - 本轮直接 COM5 测试结果：120 次回车对应 120 个读事件、每个读事件 25 字节/1 个换行；这证明行级输出在应用外是成立的。
 - 本轮发现当前 COM5 被正在运行的 `serial_terminal.exe` 占用，因此没有强行做直接串口删除测试，避免打断用户正在测试的实例。
+- 本轮 `codex/xterm-js` 分支 Tauri dev 已启动到 `target\debug\serial_terminal.exe`，无立即崩溃。
 
 ---
 *每执行2次查看/浏览器或搜索操作后更新此文件*
