@@ -12,7 +12,8 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, State};
 
-const SERIAL_READ_BUFFER_SIZE: usize = 32 * 1024;
+const SERIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
+const SERIAL_READ_TIMEOUT_MS: u64 = 5;
 const SERIAL_WRITE_BATCH_LIMIT: usize = 64 * 1024;
 
 #[derive(Default)]
@@ -83,7 +84,7 @@ fn connect(
         .data_bits(data_bits)
         .parity(parity)
         .stop_bits(stop_bits)
-        .timeout(Duration::from_millis(50))
+        .timeout(Duration::from_millis(SERIAL_READ_TIMEOUT_MS))
         .open()
         .map_err(|error| format!("打开串口失败: {error}"))?;
 

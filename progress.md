@@ -191,6 +191,24 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 13：回车连续输出成段刷新定位
+- **状态：** complete
+- 执行的操作：
+  - 读取用户最新反馈，确认现象是按住回车时输出成段刷新，而不是单纯键入/删除延迟。
+  - 临时加入前端测量点并通过构建验证，随后因为 WebView2 调试端口返回 502，改用更直接的 COM5 串口读写测试先分离硬件/应用边界。
+  - 停掉 Tauri dev 后，用 .NET SerialPort 直接打开 COM5，按 30ms 间隔发送 120 次回车并记录读事件。
+  - 直接测试结果：120 次发送对应 120 次读事件，总 3000 字节，每次 25 字节且 1 个换行，平均间隔约 28.4ms。
+  - 移除所有临时测量代码，没有保留 debug API。
+  - 前端 RX 改为收到 `serial-data` 立即 `terminal.write(new Uint8Array(data))`，只保留统计更新的 rAF 节流。
+  - Rust reader 从 32KB/50ms 改为 4KB/5ms，降低短交互输出在串口读取层被聚合的概率。
+  - 运行前端构建、Rust 格式化/检查、Tauri info 和 Tauri dev 启动验证。
+- 创建/修改的文件：
+  - `src/main.ts`
+  - `src-tauri/src/lib.rs`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -235,6 +253,12 @@
 | `cargo fmt` | 删除节流最终代码 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `cargo check` | 删除节流最终代码 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run tauri -- info` | 删除节流最终代码 | Tauri 环境检测通过 | 通过 | 通过 |
+| 直接 COM5 读写测试 | 120 次回车，30ms 间隔 | 确认硬件/驱动是否逐行返回 | 120 个读事件，总 3000 字节，每次 25 字节/1 换行，平均间隔约 28.4ms | 通过 |
+| `npm run build` | 低延迟 RX 改动后 | TypeScript/Vite 构建通过 | 构建通过；Vite 提示 Ghostty chunk 大小超过 500 kB | 通过 |
+| `cargo fmt` | 低延迟 RX 改动后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `cargo check` | 低延迟 RX 改动后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run tauri -- info` | 低延迟 RX 改动后 | Tauri 环境检测通过 | 通过 | 通过 |
+| `npm run tauri dev` | 低延迟 RX 改动后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止；仅有 MSVC linker stdout 警告 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -250,12 +274,13 @@
 | 2026-09-10 | 连续输入/删除仍卡，怀疑终端本身 | 1 | 切换 xterm 官方 WebGL renderer，并将 RX 改为字节流直接写入 xterm |
 | 2026-09-10 | WebGL xterm 仍卡，用户要求换终端 | 1 | 替换为 `ghostty-web` 并清理 xterm/WebGL 残留 |
 | 2026-09-10 | Ghostty 后连续输入/删除仍有卡死反馈 | 1 | 用 CDP 和真实 COM5 分层定位，确认是 `write_text` invoke 抖动被过密 flush 放大；改为删除键专用合并和有限并发写入 |
+| 2026-09-10 | 按住回车时输出成段刷新 | 1 | 直接 COM5 测试证明硬件逐行返回，改为低延迟 reader 和前端即时写终端 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 12：证据驱动输入/删除卡顿定位 |
-| 我要去哪里？ | 提交本轮串口发送节流修复，并等待用户实机复测 |
+| 我在哪里？ | 完成阶段 13：回车连续输出成段刷新定位 |
+| 我要去哪里？ | 提交本轮低延迟 RX 修复，并等待用户实机复测 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

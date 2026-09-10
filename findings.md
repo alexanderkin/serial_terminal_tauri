@@ -12,6 +12,7 @@
 - 连续输入和删除仍卡，用户判断是终端问题；允许在必要时换一种终端。
 - WebGL xterm 方案实机仍卡，用户明确要求“换终端”。
 - Ghostty 终端替换后仍有卡死/卡顿反馈；用户要求先调试抓证据，再基于证据修改。
+- 按住回车时仍能看到输出成段刷新；期望是一行一行连续刷出。
 
 ## 研究发现
 - 当前 Tauri 版前端终端是自研文本渲染，天然缺少完整 ANSI、IME、宽字符、滚动缓冲、选择和 resize 语义。
@@ -41,6 +42,10 @@
 - 真实 COM5 键盘链路中，连续按键触发的 `write_text` invoke 曾出现 480ms 单次抖动；调整并发后仍可出现 240ms 级别峰值，说明 IPC/后端写入返回时间会抖动。
 - 旧策略的 2ms 合并窗口加 Backspace/Delete 立即 flush，在真实按键间隔下几乎变成每个删除键一次 `write_text`，会把 IPC 抖动放大成明显卡顿。
 - 删除键专用 40ms 合并窗口后，连续 240 次 Backspace 的发送批次数从 240 次下降到约 120 次，串口 flush 总耗时和最大耗时明显下降，且无长任务。
+- 直接用 .NET SerialPort 绕过应用打开 COM5，按 30ms 间隔发送 120 次回车时，得到 120 个读事件、总 3000 字节、每次 25 字节且每次 1 个换行；平均读事件间隔约 28.4ms。
+- 直接 COM5 测试说明设备/驱动可以逐行返回；应用中“成段刷新”主要来自应用自己的读取和前端输出聚合。
+- Rust 当前 reader 使用 32KB buffer 和 50ms timeout；在 Windows serialport 语义下，这会为了吞吐把短交互输出攒到超时或缓冲边界。
+- 前端 `queueSerialOutput` 还会把同一动画帧内的多个 `serial-data` 合并成一次 `terminal.write`；这进一步增加“几行一起刷”的视觉感。
 
 ## 技术决策
 | 决策 | 理由 |
@@ -65,6 +70,8 @@
 | 不继续盲目替换终端 | CDP 证据显示 Ghostty 渲染链路稳定，继续换终端不会命中本轮已抓到的卡顿点 |
 | 前端串口写入采用有限并发 | 允许最多 4 个 `write_text` invoke 并行消化积压，避免单个慢 invoke 把队列完全堵死 |
 | 删除输入使用更长 debounce | Backspace/Delete 连续重复时合并发送，降低 IPC 数量，同时保留真实串口发送而不是本地假预览 |
+| 串口 reader 改为低延迟读 | 回车交互输出需要优先保证行级反馈，4KB buffer + 5ms timeout 比 32KB + 50ms 更符合终端手感 |
+| RX 到达即写入终端 | 统计 DOM 可以帧级节流，但终端正文不应为省重绘把交互输出攒到下一帧统一写 |
 
 ## 遇到的问题
 | 问题 | 解决方案 |
@@ -81,6 +88,7 @@
 | 连续输入/删除仍卡且怀疑终端本身 | 接入 `@xterm/addon-webgl`，使用 GPU renderer；若不可用自动回退 DOM |
 | WebGL xterm 仍卡 | 替换为 `ghostty-web`，清理 xterm/WebGL 依赖和内部 CSS，修正挂载和键盘拦截语义 |
 | Ghostty 后仍反馈卡死 | 通过 CDP profile、合成输出、真实 Tauri RX 和真实 COM5 键盘输入分层定位，确认主要瓶颈是 `write_text` 调用密度和 invoke 抖动，而不是终端渲染 |
+| 按住回车输出成段刷新 | 直接 COM5 读写测试显示硬件逐行返回；移除前端 RX rAF 合并，并降低 Rust reader timeout/buffer |
 
 ## 资源
 - 本地 `serial_terminal` Tauri 项目。
@@ -95,6 +103,7 @@
 - 本轮已安装 `@xterm/addon-webgl`，并通过 `npm run build`、`cargo check`、`npm run tauri -- info`、`npm run tauri dev`；Tauri dev 启动后保持运行 10 秒无初始化崩溃。
 - 本轮开始替换为 `ghostty-web`；前端 `npm run build` 已通过，待继续做 Rust/Tauri 启动验证。
 - 本轮已完成证据驱动性能定位；所有临时调试命令和前端 debug API 已移除，最终生产改动仅保留串口发送节流策略。
+- 本轮直接 COM5 测试结果：120 次回车对应 120 个读事件、每个读事件 25 字节/1 个换行；这证明行级输出在应用外是成立的。
 
 ---
 *每执行2次查看/浏览器或搜索操作后更新此文件*

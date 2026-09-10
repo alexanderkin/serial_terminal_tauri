@@ -216,10 +216,6 @@ let pendingSerialText = "";
 let serialFlushTimer: number | null = null;
 let serialWritesInFlight = 0;
 let terminalContextMenu: TerminalContextMenuState | null = null;
-let serialOutputQueued = false;
-let pendingTerminalOutputChunks: Uint8Array[] = [];
-let pendingTerminalOutputLength = 0;
-let pendingTerminalOutputBytes = 0;
 let pendingStatsUpdate = false;
 
 function renderApp(): void {
@@ -422,7 +418,6 @@ function bindChromeEvents(): void {
   });
 
   document.querySelector("#clear-terminal")?.addEventListener("click", () => {
-    clearPendingTerminalOutput();
     terminal.clear();
     terminal.focus();
   });
@@ -929,7 +924,6 @@ async function connectSerial(): Promise<void> {
   state.mode = "connecting";
   state.lastError = "";
   clearPendingSerialText();
-  clearPendingTerminalOutput();
   renderApp();
 
   try {
@@ -949,7 +943,6 @@ async function connectSerial(): Promise<void> {
 
 async function disconnectSerial(): Promise<void> {
   clearPendingSerialText();
-  clearPendingTerminalOutput();
   try {
     await invoke<void>("disconnect");
   } catch (error) {
@@ -1038,12 +1031,6 @@ function clearPendingSerialText(): void {
   }
 }
 
-function clearPendingTerminalOutput(): void {
-  pendingTerminalOutputChunks = [];
-  pendingTerminalOutputLength = 0;
-  pendingTerminalOutputBytes = 0;
-}
-
 function normalizeTerminalInput(data: string): string {
   return data.replace(/\x1b\[3~/g, "\b").replace(/\x7f/g, "\b");
 }
@@ -1122,49 +1109,13 @@ function queueSerialOutput(data: number[], byteCount: number): void {
     return;
   }
 
-  const chunk = new Uint8Array(data);
-  pendingTerminalOutputChunks.push(chunk);
-  pendingTerminalOutputLength += chunk.length;
-  pendingTerminalOutputBytes += byteCount;
-
-  if (serialOutputQueued) {
-    return;
+  if (data.length > 0) {
+    terminal.write(new Uint8Array(data));
   }
-
-  serialOutputQueued = true;
-  requestAnimationFrame(() => {
-    serialOutputQueued = false;
-    const outputChunks = pendingTerminalOutputChunks;
-    const outputLength = pendingTerminalOutputLength;
-    pendingTerminalOutputChunks = [];
-    pendingTerminalOutputLength = 0;
-
-    const rxBytes = pendingTerminalOutputBytes;
-    pendingTerminalOutputBytes = 0;
-
-    if (outputLength > 0) {
-      terminal.write(mergeTerminalOutputChunks(outputChunks, outputLength));
-    }
-    if (rxBytes > 0) {
-      state.rxBytes += rxBytes;
-    }
-
+  if (byteCount > 0) {
+    state.rxBytes += byteCount;
     requestStatsUpdate();
-  });
-}
-
-function mergeTerminalOutputChunks(chunks: Uint8Array[], totalLength: number): Uint8Array {
-  if (chunks.length === 1) {
-    return chunks[0];
   }
-
-  const merged = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return merged;
 }
 
 function updateOutput(selector: string, text: string): void {
@@ -1361,7 +1312,6 @@ async function setupBackendListeners(): Promise<void> {
     state.mode = "error";
     state.lastError = event.payload.message;
     clearPendingSerialText();
-    clearPendingTerminalOutput();
     terminal.writeln(`\x1b[31m${event.payload.message}\x1b[0m`);
     void invoke<void>("disconnect");
     renderApp();

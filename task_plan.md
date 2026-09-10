@@ -6,7 +6,7 @@
 
 ## 下一步
 
-证据驱动的输入/删除卡顿定位已完成，等待用户实机复测连续输入和连续删除手感。
+回车连续输出成段刷新问题已按证据修复，等待用户实机复测按住回车时的显示连续性。
 
 ## 当前阶段
 
@@ -108,6 +108,15 @@
 - [x] 构建、Rust 检查、Tauri info 和 Tauri dev 热重载验证
 - **状态：** complete
 
+### 阶段 13：回车连续输出成段刷新定位
+- [x] 直接绕过应用打开 COM5，按 30ms 间隔发送 120 次回车并记录串口读事件
+- [x] 证明设备/串口可按 120 次回车返回 120 个单行读事件，不是硬件端天然成段输出
+- [x] 定位应用侧批量感来自 Rust 50ms 大缓冲读取和前端 RX 帧级合并
+- [x] 将 Rust 串口读取改为 4KB buffer + 5ms timeout，降低 read 端聚合延迟
+- [x] 将前端 RX 输出改为 serial-data 到达即写入终端，统计更新仍保留帧级节流
+- [x] 构建、Rust 检查、Tauri info 和 Tauri dev 启动验证
+- **状态：** complete
+
 ## 关键问题
 
 1. 终端核心必须使用成熟库处理 ANSI、IME、宽字符、滚动缓冲和选择，不能继续手写简化版。
@@ -134,6 +143,7 @@
 | 换用 `ghostty-web` | 用户实测 WebGL xterm 仍卡，需要替换完整终端核心；`ghostty-web` 提供 Ghostty WASM parser 和 canvas renderer，同时保留接近 xterm 的 API，迁移风险低于重写 |
 | 保留 Ghostty，优化串口发送节流 | CDP 证据显示 Ghostty 渲染不是卡顿根因；真实卡顿来自 `write_text` IPC 在连续按键下被放大 |
 | Backspace/Delete 不再立即 flush | 连续删除对实时性敏感但不应每个键一次 invoke；40ms 合并可明显降低 IPC 数量 |
+| 串口 RX 走低延迟路径 | 直接 COM5 测试证明硬件可一行一行返回，应用不应再用 50ms 大读缓冲和前端 rAF 合并把多行攒成一段 |
 
 ## 遇到的错误
 
@@ -148,6 +158,7 @@
 | 连续输入/删除仍卡，怀疑终端本身 | 1 | 切换 xterm 官方 WebGL renderer，并改为字节流直接写入终端 |
 | WebGL xterm 仍卡，用户要求换终端 | 1 | 切换到 `ghostty-web`，删除 xterm/WebGL 依赖，并按新库语义重做终端挂载 |
 | Ghostty 后连续输入/删除仍卡 | 1 | 用 CDP 和真实 COM5 输入链路定位到 `write_text` invoke 抖动与过密 flush；改为有限并发和删除键专用合并窗口 |
+| 按住回车时输出成段刷新 | 1 | 直接 COM5 测试确认硬件逐行返回；改为低延迟 reader 和前端即时写终端 |
 
 ## 提交
 
