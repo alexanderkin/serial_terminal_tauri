@@ -199,9 +199,15 @@ function renderApp(): void {
           <span class="window-title">Serial Terminal</span>
         </div>
         <div class="window-controls">
-          <button id="window-minimize" class="window-control" type="button" aria-label="最小化" title="最小化">-</button>
-          <button id="window-maximize" class="window-control" type="button" aria-label="最大化/还原" title="最大化/还原">□</button>
-          <button id="window-close" class="window-control close" type="button" aria-label="关闭" title="关闭">×</button>
+          <button id="window-minimize" class="window-control" type="button" aria-label="最小化" title="最小化">
+            <span class="window-control-icon">&#xE921;</span>
+          </button>
+          <button id="window-maximize" class="window-control" type="button" aria-label="最大化/还原" title="最大化/还原">
+            <span id="window-maximize-icon" class="window-control-icon">&#xE922;</span>
+          </button>
+          <button id="window-close" class="window-control close" type="button" aria-label="关闭" title="关闭">
+            <span class="window-control-icon">&#xE8BB;</span>
+          </button>
         </div>
       </div>
 
@@ -400,12 +406,14 @@ function bindChromeEvents(): void {
 }
 
 function bindWindowChromeEvents(): void {
+  void updateWindowMaximizeIcon();
+
   document.querySelector("#window-minimize")?.addEventListener("click", () => {
     void currentWindow.minimize();
   });
 
   document.querySelector("#window-maximize")?.addEventListener("click", () => {
-    void currentWindow.toggleMaximize();
+    void toggleWindowMaximize();
   });
 
   document.querySelector("#window-close")?.addEventListener("click", () => {
@@ -413,7 +421,7 @@ function bindWindowChromeEvents(): void {
   });
 
   document.querySelector(".window-drag-region")?.addEventListener("dblclick", () => {
-    void currentWindow.toggleMaximize();
+    void toggleWindowMaximize();
   });
 
   document.querySelectorAll<HTMLElement>("[data-resize-direction]").forEach((handle) => {
@@ -431,6 +439,24 @@ function bindWindowChromeEvents(): void {
       void currentWindow.startResizeDragging(direction);
     });
   });
+}
+
+async function toggleWindowMaximize(): Promise<void> {
+  await currentWindow.toggleMaximize();
+  await updateWindowMaximizeIcon();
+}
+
+async function updateWindowMaximizeIcon(): Promise<void> {
+  const icon = document.querySelector("#window-maximize-icon");
+  if (!icon) {
+    return;
+  }
+
+  try {
+    icon.textContent = (await currentWindow.isMaximized()) ? "\uE923" : "\uE922";
+  } catch {
+    icon.textContent = "\uE922";
+  }
 }
 
 function renderSegment(
@@ -1050,6 +1076,7 @@ async function setupBackendListeners(): Promise<void> {
 
 window.addEventListener("resize", () => {
   updateScale();
+  void updateWindowMaximizeIcon();
   if (state.activePicker) {
     const button = document.querySelector<HTMLElement>(`[data-picker-id="${state.activePicker}"]`);
     if (button) {

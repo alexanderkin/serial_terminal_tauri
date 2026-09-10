@@ -127,13 +127,13 @@ input:disabled {
 .window-control {
   width: 46px;
   height: 100%;
+  display: grid;
+  place-items: center;
   border: 0;
   border-radius: 0;
+  padding: 0;
   background: transparent;
   color: #d6d6d6;
-  font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
-  font-size: 13px;
-  line-height: 1;
 }
 
 .window-control:hover {
@@ -144,6 +144,13 @@ input:disabled {
 .window-control.close:hover {
   background: #c42b1c;
   color: #ffffff;
+}
+
+.window-control-icon {
+  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", "Segoe UI Symbol", sans-serif;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1;
 }
 
 .resize-handle {
