@@ -8,6 +8,7 @@ import "@xterm/xterm/css/xterm.css";
 type ConnectionMode = "disconnected" | "connecting" | "connected" | "error";
 type Parity = "none" | "even" | "odd";
 type PickerId = "port" | "baud" | "font";
+type TerminalContextMenuAction = "copy" | "paste" | "clear";
 type ResizeDirection =
   | "North"
   | "South"
@@ -24,6 +25,13 @@ interface DropdownPosition {
   width: number;
   maxHeight: number;
   placement: "up" | "down";
+}
+
+interface TerminalContextMenuState {
+  left: number;
+  top: number;
+  canCopy: boolean;
+  canPaste: boolean;
 }
 
 interface SerialConfig {
@@ -92,6 +100,9 @@ const fallbackFontFamilies = [
 ];
 
 const storageKey = "serial-terminal-settings-v1";
+const serialWriteChunkSize = 256;
+const serialWriteDelayMs = 2;
+const terminalMenuMargin = 8;
 const savedSettings = readSavedSettings();
 const state: AppState = {
   ports: [],
@@ -133,7 +144,7 @@ const terminal = new Terminal({
   fontFamily: terminalFontFamily(),
   fontSize: state.fontSize,
   lineHeight: state.lineSpacing,
-  scrollback: 100000,
+  scrollback: 30000,
   theme: {
     background: "#050505",
     foreground: "#d7d7d7",
@@ -178,6 +189,11 @@ let fitQueued = false;
 let pendingSerialText = "";
 let serialFlushTimer: number | null = null;
 let serialWriteInFlight = false;
+let terminalContextMenu: TerminalContextMenuState | null = null;
+let serialOutputQueued = false;
+let pendingTerminalOutput = "";
+let pendingTerminalOutputBytes = 0;
+let pendingStatsUpdate = false;
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
@@ -313,6 +329,7 @@ function renderApp(): void {
           <div id="terminal-host" class="terminal-host"></div>
         </section>
       </main>
+      ${renderTerminalContextMenu()}
       ${renderPickerPortal()}
     </div>
   `;
@@ -349,11 +366,10 @@ function attachTerminal(): void {
   });
 
   host.addEventListener("contextmenu", (event) => {
-    if (terminal.hasSelection()) {
-      event.preventDefault();
-      copySelection(true);
-    }
-  });
+    event.preventDefault();
+    event.stopPropagation();
+    openTerminalContextMenu(event.clientX, event.clientY);
+  }, { capture: true });
 }
 
 function bindChromeEvents(): void {
@@ -374,6 +390,16 @@ function bindChromeEvents(): void {
   document.querySelector("#clear-terminal")?.addEventListener("click", () => {
     terminal.clear();
     terminal.focus();
+  });
+
+  document.querySelectorAll<HTMLButtonElement>('[data-terminal-menu-action]').forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.terminalMenuAction as TerminalContextMenuAction | undefined;
+      if (!action) {
+        return;
+      }
+      void runTerminalContextMenuAction(action);
+    });
   });
 
   document.querySelectorAll<HTMLButtonElement>("[data-setting]").forEach((button) => {
@@ -403,6 +429,120 @@ function bindChromeEvents(): void {
     saveSettings();
     applyTerminalOptions();
   });
+}
+
+function renderTerminalContextMenu(): string {
+  if (!terminalContextMenu) {
+    return "";
+  }
+
+  return `
+    <div
+      id="terminal-context-menu"
+      class="terminal-context-menu"
+      role="menu"
+      style="left: ${terminalContextMenu.left}px; top: ${terminalContextMenu.top}px"
+    >
+      <button
+        data-terminal-menu-action="copy"
+        class="terminal-context-item"
+        type="button"
+        ${terminalContextMenu.canCopy ? "" : "disabled"}
+      >
+        <span class="terminal-context-icon">&#xE8C8;</span>
+        <span>复制</span>
+      </button>
+      <button
+        data-terminal-menu-action="paste"
+        class="terminal-context-item"
+        type="button"
+        ${terminalContextMenu.canPaste ? "" : "disabled"}
+      >
+        <span class="terminal-context-icon">&#xE77F;</span>
+        <span>粘贴</span>
+      </button>
+      <button data-terminal-menu-action="clear" class="terminal-context-item" type="button">
+        <span class="terminal-context-icon">&#xE74D;</span>
+        <span>清空</span>
+      </button>
+    </div>
+  `;
+}
+
+function openTerminalContextMenu(clientX: number, clientY: number): void {
+  const menuSize = terminalContextMenuSize();
+  terminalContextMenu = {
+    left: clamp(clientX, terminalMenuMargin, window.innerWidth - menuSize.width - terminalMenuMargin),
+    top: clamp(clientY, terminalMenuMargin, window.innerHeight - menuSize.height - terminalMenuMargin),
+    canCopy: terminal.hasSelection(),
+    canPaste: state.mode === "connected",
+  };
+  renderApp();
+  terminal.focus();
+}
+
+function closeTerminalContextMenu(): boolean {
+  if (!terminalContextMenu) {
+    return false;
+  }
+
+  terminalContextMenu = null;
+  return true;
+}
+
+function terminalContextMenuSize(): { width: number; height: number } {
+  const scale = currentScale();
+  const width = clamp(172 * scale, 136, 172);
+  const itemHeight = clamp(34 * scale, 28, 34);
+  const padding = 8 * scale;
+  const itemGap = 4;
+
+  return {
+    width,
+    height: itemHeight * 3 + padding + itemGap,
+  };
+}
+
+async function runTerminalContextMenuAction(action: TerminalContextMenuAction): Promise<void> {
+  if (action === "copy") {
+    const selection = terminal.getSelection();
+    closeTerminalContextMenu();
+    renderApp();
+    if (selection.length > 0) {
+      void navigator.clipboard.writeText(selection);
+    }
+    terminal.focus();
+    return;
+  }
+
+  if (action === "paste") {
+    closeTerminalContextMenu();
+    renderApp();
+    await pasteFromClipboard();
+    return;
+  }
+
+  closeTerminalContextMenu();
+  renderApp();
+  terminal.clear();
+  terminal.focus();
+}
+
+async function pasteFromClipboard(): Promise<void> {
+  if (state.mode !== "connected") {
+    return;
+  }
+
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text.length > 0) {
+      queueSerialText(normalizePastedText(text));
+    }
+  } catch (error) {
+    terminal.writeln(`\x1b[31m读取剪贴板失败: ${toMessage(error)}\x1b[0m`);
+  } finally {
+    terminal.focus();
+  }
 }
 
 function bindWindowChromeEvents(): void {
@@ -762,15 +902,23 @@ function queueSerialText(text: string): void {
     return;
   }
 
+  const shouldFlushNow =
+    shouldFlushImmediately(text) || pendingSerialText.length + text.length >= serialWriteChunkSize;
+
   pendingSerialText += text;
-  scheduleSerialFlush(shouldFlushImmediately(text) ? 0 : 6);
+  scheduleSerialFlush(shouldFlushNow ? 0 : serialWriteDelayMs);
 }
 
 function shouldFlushImmediately(text: string): boolean {
-  return /[\r\u0003\u0004\u001a]/.test(text);
+  return /[\r\n\b\x1b\x7f\u0003\u0004\u001a]/.test(text);
 }
 
 function scheduleSerialFlush(delayMs: number): void {
+  if (delayMs === 0 && serialFlushTimer !== null) {
+    window.clearTimeout(serialFlushTimer);
+    serialFlushTimer = null;
+  }
+
   if (serialFlushTimer !== null) {
     return;
   }
@@ -786,13 +934,13 @@ async function flushSerialText(): Promise<void> {
     return;
   }
 
-  const text = pendingSerialText;
-  pendingSerialText = "";
+  const text = pendingSerialText.slice(0, serialWriteChunkSize);
+  pendingSerialText = pendingSerialText.slice(text.length);
   serialWriteInFlight = true;
 
   try {
     state.txBytes = await invoke<number>("write_text", { text });
-    updateStats();
+    requestStatsUpdate();
   } catch (error) {
     state.lastError = toMessage(error);
     state.mode = "error";
@@ -816,6 +964,10 @@ function clearPendingSerialText(): void {
 
 function normalizeTerminalInput(data: string): string {
   return data.replace(/\x1b\[3~/g, "\b").replace(/\x7f/g, "\b");
+}
+
+function normalizePastedText(text: string): string {
+  return text.replace(/\r?\n/g, "\r");
 }
 
 function copySelection(clearAfterCopy = false): void {
@@ -869,6 +1021,50 @@ function queueFit(): void {
 function updateStats(): void {
   updateText("#rx-stat", `RX ${formatBytes(state.rxBytes)}`);
   updateText("#tx-stat", `TX ${formatBytes(state.txBytes)}`);
+}
+
+function requestStatsUpdate(): void {
+  if (pendingStatsUpdate) {
+    return;
+  }
+
+  pendingStatsUpdate = true;
+  requestAnimationFrame(() => {
+    pendingStatsUpdate = false;
+    updateStats();
+  });
+}
+
+function queueSerialOutput(text: string, byteCount: number): void {
+  if (text.length === 0 && byteCount === 0) {
+    return;
+  }
+
+  pendingTerminalOutput += text;
+  pendingTerminalOutputBytes += byteCount;
+
+  if (serialOutputQueued) {
+    return;
+  }
+
+  serialOutputQueued = true;
+  requestAnimationFrame(() => {
+    serialOutputQueued = false;
+    const output = pendingTerminalOutput;
+    pendingTerminalOutput = "";
+
+    const rxBytes = pendingTerminalOutputBytes;
+    pendingTerminalOutputBytes = 0;
+
+    if (output.length > 0) {
+      terminal.write(output);
+    }
+    if (rxBytes > 0) {
+      state.rxBytes += rxBytes;
+    }
+
+    requestStatsUpdate();
+  });
 }
 
 function updateOutput(selector: string, text: string): void {
@@ -1058,10 +1254,8 @@ function toMessage(error: unknown): string {
 
 async function setupBackendListeners(): Promise<void> {
   await listen<SerialDataPayload>("serial-data", (event) => {
-    state.rxBytes += event.payload.byte_count;
     const text = serialDecoder.decode(new Uint8Array(event.payload.data), { stream: true });
-    terminal.write(text);
-    updateStats();
+    queueSerialOutput(text, event.payload.byte_count);
   });
 
   await listen<SerialErrorPayload>("serial-error", (event) => {
@@ -1077,6 +1271,12 @@ async function setupBackendListeners(): Promise<void> {
 window.addEventListener("resize", () => {
   updateScale();
   void updateWindowMaximizeIcon();
+  let shouldRender = false;
+
+  if (closeTerminalContextMenu()) {
+    shouldRender = true;
+  }
+
   if (state.activePicker) {
     const button = document.querySelector<HTMLElement>(`[data-picker-id="${state.activePicker}"]`);
     if (button) {
@@ -1084,33 +1284,57 @@ window.addEventListener("resize", () => {
         button,
         pickerOptions(state.activePicker).length,
       );
-      renderApp();
+      shouldRender = true;
     }
   }
+
+  if (shouldRender) {
+    renderApp();
+  }
+
   queueFit();
 });
 
 document.addEventListener("pointerdown", (event) => {
-  if (!state.activePicker) {
-    return;
-  }
-
   const target = event.target;
-  if (target instanceof Element && (target.closest(".picker-anchor") || target.closest("#picker-portal"))) {
-    return;
+  let shouldRender = false;
+
+  if (terminalContextMenu && !(target instanceof Element && target.closest("#terminal-context-menu"))) {
+    shouldRender = closeTerminalContextMenu();
   }
 
-  closePicker();
-  renderApp();
+  if (state.activePicker) {
+    if (target instanceof Element && (target.closest(".picker-anchor") || target.closest("#picker-portal"))) {
+      if (shouldRender) {
+        renderApp();
+      }
+      return;
+    }
+
+    closePicker();
+    shouldRender = true;
+  }
+
+  if (shouldRender) {
+    renderApp();
+  }
 });
 
 document.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape" || !state.activePicker) {
+  if (event.key !== "Escape") {
     return;
   }
 
-  closePicker();
-  renderApp();
+  let shouldRender = closeTerminalContextMenu();
+
+  if (state.activePicker) {
+    closePicker();
+    shouldRender = true;
+  }
+
+  if (shouldRender) {
+    renderApp();
+  }
 });
 
 updateScale();

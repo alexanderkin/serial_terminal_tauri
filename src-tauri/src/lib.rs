@@ -12,6 +12,9 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, State};
 
+const SERIAL_READ_BUFFER_SIZE: usize = 32 * 1024;
+const SERIAL_WRITE_BATCH_LIMIT: usize = 64 * 1024;
+
 #[derive(Default)]
 struct SerialManager {
     inner: Mutex<SerialState>,
@@ -143,7 +146,7 @@ fn spawn_reader(
     reader_stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
+        let mut buffer = [0_u8; SERIAL_READ_BUFFER_SIZE];
 
         while !reader_stop.load(Ordering::Relaxed) {
             match port.read(&mut buffer) {
@@ -176,12 +179,30 @@ fn spawn_writer(
     writer_rx: mpsc::Receiver<Vec<u8>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        while let Ok(bytes) = writer_rx.recv() {
-            if bytes.is_empty() {
+        let mut pending: Vec<u8> = Vec::with_capacity(4096);
+
+        while let Ok(mut bytes) = writer_rx.recv() {
+            if !bytes.is_empty() {
+                pending.append(&mut bytes);
+            }
+
+            while pending.len() < SERIAL_WRITE_BATCH_LIMIT {
+                match writer_rx.try_recv() {
+                    Ok(mut bytes) => {
+                        if !bytes.is_empty() {
+                            pending.append(&mut bytes);
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+
+            if pending.is_empty() {
                 continue;
             }
 
-            if let Err(error) = port.write_all(&bytes) {
+            if let Err(error) = port.write_all(&pending) {
                 let _ = app.emit(
                     "serial-error",
                     SerialError {
@@ -190,6 +211,8 @@ fn spawn_writer(
                 );
                 break;
             }
+
+            pending.clear();
         }
     })
 }

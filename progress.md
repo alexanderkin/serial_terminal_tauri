@@ -113,6 +113,25 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 9：主题右键菜单与真实输入链路优化
+- **状态：** complete
+- 执行的操作：
+  - 读取最新需求，确认不能恢复此前被回滚的本地输入预览方向。
+  - 使用 GPT-5.3-Codex-Spark 子 agent 完成第一版代码改动，并由主流程复查修正。
+  - 终端右键改为主题自绘菜单，包含复制、粘贴、清空，并按选区/连接状态禁用不可用项。
+  - 前端输入队列改为控制键抢占式 flush，普通输入短延迟合并，不做本地回显预览。
+  - RX 输出和 RX/TX 统计更新改为 requestAnimationFrame 合并。
+  - Rust writer 线程 drain channel 合并小包写入，reader buffer 增大，并移除重新引入的 `flush()`。
+  - 运行 cargo fmt、前端构建、后端检查、Tauri info 和 Tauri dev 启动验证。
+  - 准备提交到 `serial_terminal` 子仓库。
+- 创建/修改的文件：
+  - `src/main.ts`
+  - `src/styles.css`
+  - `src-tauri/src/lib.rs`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -133,6 +152,11 @@
 | `cargo check` | writer channel 后端 | 编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run tauri -- info` | writer channel 后端 | Tauri 环境检测通过 | 通过 | 通过 |
 | `npm run tauri dev` | 异步写入和无搜索 picker 后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止 | 通过 |
+| `cargo fmt` | 主题右键菜单和链路优化后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run build` | 主题右键菜单和链路优化后 | TypeScript/Vite 构建通过 | 构建通过 | 通过 |
+| `cargo check` | 主题右键菜单和链路优化后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run tauri -- info` | 主题右键菜单和链路优化后 | Tauri 环境检测通过 | 通过 | 通过 |
+| `npm run tauri dev` | 主题右键菜单和链路优化后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止；仅有 MSVC linker stdout 警告 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -144,12 +168,13 @@
 | 2026-09-10 | 端口/波特率仍为原生下拉，且下拉可能超窗 | 1 | 统一 fixed 自绘 picker，按视口空间向上/向下定位 |
 | 2026-09-10 | 终端输入和删除卡顿 | 1 | 前端批量合并发送，后端去掉每次写入 flush |
 | 2026-09-10 | 删除仍比较卡，自绘下拉不需要搜索 | 1 | 移除 picker 搜索路径，后端同步写改为 channel + writer 线程 |
+| 2026-09-10 | 终端右键菜单不符合主题，输入仍卡 | 1 | 改为主题自绘菜单，并继续优化真实串口输入/渲染链路 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 8：简化下拉与异步串口写入 |
-| 我要去哪里？ | 等待用户实机验证无搜索下拉和连续删除/输入手感 |
+| 我在哪里？ | 完成阶段 9：主题右键菜单与真实输入链路优化 |
+| 我要去哪里？ | 等待用户实机验证主题右键菜单和连续输入/删除手感 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

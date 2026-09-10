@@ -609,6 +609,65 @@ button:focus-visible,
   font-size: clamp(10px, calc(12px * var(--ui-scale)), 12px);
 }
 
+.terminal-context-menu {
+  position: fixed;
+  z-index: 90;
+  min-width: clamp(136px, calc(172px * var(--ui-scale)), 172px);
+  padding: calc(4px * var(--ui-scale));
+  border: 1px solid rgba(0, 120, 212, 0.3);
+  border-radius: 7px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0)),
+    #191919;
+  box-shadow:
+    0 18px 44px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.terminal-context-item {
+  width: 100%;
+  min-width: 0;
+  height: clamp(28px, calc(34px * var(--ui-scale)), 34px);
+  display: grid;
+  grid-template-columns: clamp(16px, calc(20px * var(--ui-scale)), 20px) minmax(0, 1fr);
+  align-items: center;
+  gap: calc(8px * var(--ui-scale));
+  border: 0;
+  border-radius: 5px;
+  padding: 0 calc(10px * var(--ui-scale));
+  background: transparent;
+  color: #ececec;
+  font-size: clamp(10px, calc(13px * var(--ui-scale)), 13px);
+  text-align: left;
+}
+
+.terminal-context-item + .terminal-context-item {
+  margin-top: 2px;
+}
+
+.terminal-context-item:hover,
+.terminal-context-item:focus-visible {
+  background: rgba(0, 120, 212, 0.28);
+  color: #ffffff;
+}
+
+.terminal-context-item:disabled {
+  color: var(--muted);
+  background: transparent;
+  opacity: 0.55;
+}
+
+.terminal-context-icon {
+  color: #9fc9ff;
+  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", "Segoe UI Symbol", sans-serif;
+  font-size: clamp(10px, calc(12px * var(--ui-scale)), 12px);
+  line-height: 1;
+}
+
+.terminal-context-item:disabled .terminal-context-icon {
+  color: var(--muted);
+}
+
 input[type="range"] {
   width: 100%;
   accent-color: var(--accent-strong);
