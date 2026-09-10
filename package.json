@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "node ./scripts/tauri-with-cargo-path.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
