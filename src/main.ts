@@ -147,7 +147,7 @@ const terminal = new Terminal({
   smoothScrollDuration: 0,
   theme: {
     background: "rgb(30, 30, 46)",
-    foreground: "#ffffff",
+    foreground: "rgb(205, 214, 244)",
     cursor: "#f1f1f1",
     cursorAccent: "rgb(30, 30, 46)",
     selectionBackground: "rgb(88, 91, 112)",
