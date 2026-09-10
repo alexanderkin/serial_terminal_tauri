@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 
@@ -132,19 +133,29 @@ if (!appRoot) {
 const app: HTMLDivElement = appRoot;
 const currentWindow = getCurrentWindow();
 
-const serialDecoder = new TextDecoder("utf-8");
 const fitAddon = new FitAddon();
 const terminal = new Terminal({
   allowProposedApi: false,
+  allowTransparency: false,
+  altClickMovesCursor: false,
   convertEol: false,
+  customGlyphs: true,
   cursorBlink: true,
   cursorStyle: "bar",
   disableStdin: false,
   drawBoldTextInBrightColors: false,
   fontFamily: terminalFontFamily(),
   fontSize: state.fontSize,
+  ignoreBracketedPasteMode: true,
+  letterSpacing: 0,
   lineHeight: state.lineSpacing,
-  scrollback: 30000,
+  minimumContrastRatio: 1,
+  rescaleOverlappingGlyphs: true,
+  rightClickSelectsWord: false,
+  screenReaderMode: false,
+  scrollback: 10000,
+  scrollOnUserInput: true,
+  smoothScrollDuration: 0,
   theme: {
     background: "#050505",
     foreground: "#d7d7d7",
@@ -184,6 +195,8 @@ terminal.attachCustomKeyEventHandler((event) => {
 
 let terminalHost: HTMLDivElement | null = null;
 let terminalInputDisposable: { dispose(): void } | null = null;
+let webglAddon: WebglAddon | null = null;
+let webglContextLossDisposable: { dispose(): void } | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let fitQueued = false;
 let pendingSerialText = "";
@@ -191,7 +204,8 @@ let serialFlushTimer: number | null = null;
 let serialWriteInFlight = false;
 let terminalContextMenu: TerminalContextMenuState | null = null;
 let serialOutputQueued = false;
-let pendingTerminalOutput = "";
+let pendingTerminalOutputChunks: Uint8Array[] = [];
+let pendingTerminalOutputLength = 0;
 let pendingTerminalOutputBytes = 0;
 let pendingStatsUpdate = false;
 
@@ -351,6 +365,7 @@ function attachTerminal(): void {
   } else {
     terminal.open(host);
   }
+  activateWebglRenderer();
   terminal.focus();
   queueFit();
 
@@ -372,6 +387,27 @@ function attachTerminal(): void {
   }, { capture: true });
 }
 
+function activateWebglRenderer(): void {
+  if (webglAddon || !terminal.element) {
+    return;
+  }
+
+  try {
+    const addon = new WebglAddon();
+    webglContextLossDisposable = addon.onContextLoss(() => {
+      webglContextLossDisposable?.dispose();
+      webglContextLossDisposable = null;
+      webglAddon?.dispose();
+      webglAddon = null;
+      terminal.refresh(0, terminal.rows - 1);
+    });
+    terminal.loadAddon(addon);
+    webglAddon = addon;
+  } catch (error) {
+    console.warn("WebGL terminal renderer is unavailable, falling back to DOM renderer.", error);
+  }
+}
+
 function bindChromeEvents(): void {
   bindWindowChromeEvents();
 
@@ -388,6 +424,7 @@ function bindChromeEvents(): void {
   });
 
   document.querySelector("#clear-terminal")?.addEventListener("click", () => {
+    clearPendingTerminalOutput();
     terminal.clear();
     terminal.focus();
   });
@@ -817,6 +854,7 @@ function applyTerminalOptions(): void {
   terminal.options.fontFamily = terminalFontFamily();
   terminal.options.fontSize = state.fontSize;
   terminal.options.lineHeight = state.lineSpacing;
+  webglAddon?.clearTextureAtlas();
   queueFit();
   terminal.focus();
 }
@@ -867,6 +905,7 @@ async function connectSerial(): Promise<void> {
   state.mode = "connecting";
   state.lastError = "";
   clearPendingSerialText();
+  clearPendingTerminalOutput();
   renderApp();
 
   try {
@@ -886,6 +925,7 @@ async function connectSerial(): Promise<void> {
 
 async function disconnectSerial(): Promise<void> {
   clearPendingSerialText();
+  clearPendingTerminalOutput();
   try {
     await invoke<void>("disconnect");
   } catch (error) {
@@ -962,6 +1002,12 @@ function clearPendingSerialText(): void {
   }
 }
 
+function clearPendingTerminalOutput(): void {
+  pendingTerminalOutputChunks = [];
+  pendingTerminalOutputLength = 0;
+  pendingTerminalOutputBytes = 0;
+}
+
 function normalizeTerminalInput(data: string): string {
   return data.replace(/\x1b\[3~/g, "\b").replace(/\x7f/g, "\b");
 }
@@ -1035,12 +1081,14 @@ function requestStatsUpdate(): void {
   });
 }
 
-function queueSerialOutput(text: string, byteCount: number): void {
-  if (text.length === 0 && byteCount === 0) {
+function queueSerialOutput(data: number[], byteCount: number): void {
+  if (data.length === 0 && byteCount === 0) {
     return;
   }
 
-  pendingTerminalOutput += text;
+  const chunk = new Uint8Array(data);
+  pendingTerminalOutputChunks.push(chunk);
+  pendingTerminalOutputLength += chunk.length;
   pendingTerminalOutputBytes += byteCount;
 
   if (serialOutputQueued) {
@@ -1050,14 +1098,16 @@ function queueSerialOutput(text: string, byteCount: number): void {
   serialOutputQueued = true;
   requestAnimationFrame(() => {
     serialOutputQueued = false;
-    const output = pendingTerminalOutput;
-    pendingTerminalOutput = "";
+    const outputChunks = pendingTerminalOutputChunks;
+    const outputLength = pendingTerminalOutputLength;
+    pendingTerminalOutputChunks = [];
+    pendingTerminalOutputLength = 0;
 
     const rxBytes = pendingTerminalOutputBytes;
     pendingTerminalOutputBytes = 0;
 
-    if (output.length > 0) {
-      terminal.write(output);
+    if (outputLength > 0) {
+      terminal.write(mergeTerminalOutputChunks(outputChunks, outputLength));
     }
     if (rxBytes > 0) {
       state.rxBytes += rxBytes;
@@ -1065,6 +1115,20 @@ function queueSerialOutput(text: string, byteCount: number): void {
 
     requestStatsUpdate();
   });
+}
+
+function mergeTerminalOutputChunks(chunks: Uint8Array[], totalLength: number): Uint8Array {
+  if (chunks.length === 1) {
+    return chunks[0];
+  }
+
+  const merged = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
 }
 
 function updateOutput(selector: string, text: string): void {
@@ -1254,14 +1318,14 @@ function toMessage(error: unknown): string {
 
 async function setupBackendListeners(): Promise<void> {
   await listen<SerialDataPayload>("serial-data", (event) => {
-    const text = serialDecoder.decode(new Uint8Array(event.payload.data), { stream: true });
-    queueSerialOutput(text, event.payload.byte_count);
+    queueSerialOutput(event.payload.data, event.payload.byte_count);
   });
 
   await listen<SerialErrorPayload>("serial-error", (event) => {
     state.mode = "error";
     state.lastError = event.payload.message;
     clearPendingSerialText();
+    clearPendingTerminalOutput();
     terminal.writeln(`\x1b[31m${event.payload.message}\x1b[0m`);
     void invoke<void>("disconnect");
     renderApp();

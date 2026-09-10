@@ -685,18 +685,21 @@ output {
   overflow: hidden;
   padding: calc(16px * var(--ui-scale));
   background: var(--terminal);
+  contain: layout paint;
 }
 
 .terminal-host {
   width: 100%;
   height: 100%;
   background: var(--terminal);
+  contain: strict;
   outline: 0;
 }
 
 .terminal-host .xterm {
   width: 100%;
   height: 100%;
+  contain: strict;
 }
 
 .terminal-host .xterm-viewport {
@@ -707,6 +710,7 @@ output {
 
 .terminal-host .xterm-screen {
   width: 100% !important;
+  transform: translateZ(0);
 }
 
 .terminal-host .xterm-rows {

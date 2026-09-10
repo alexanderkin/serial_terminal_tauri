@@ -132,6 +132,27 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 10：终端渲染器性能修复
+- **状态：** complete
+- 执行的操作：
+  - 读取用户反馈，确认连续输入/删除仍卡，本轮重点转向终端渲染器。
+  - 使用 GPT-5.3-Codex-Spark 子 agent 调查 xterm renderer、DOM 重挂载和 WebGL 插件现状。
+  - 安装 `@xterm/addon-webgl`，将 xterm 渲染后端切换为 WebGL 优先。
+  - 增加 WebGL context loss 回退逻辑，避免 WebGL2 不可用时终端不可用。
+  - 将 RX 输出从应用层 `TextDecoder` + 字符串拼接改为 `Uint8Array` 合并后直接写入 xterm。
+  - 调整终端性能选项：关闭透明、关闭右键选词、启用自定义字形/重叠字形缩放、取消平滑滚动，并将 scrollback 调整为 10000。
+  - 给终端区域增加 layout/paint containment，减少终端重绘影响外层 UI。
+  - 运行前端构建、Rust 格式化/检查、Tauri info 和 Tauri dev 启动验证。
+  - 提交到 `serial_terminal` 子仓库。
+- 创建/修改的文件：
+  - `package.json`
+  - `package-lock.json`
+  - `src/main.ts`
+  - `src/styles.css`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -157,6 +178,11 @@
 | `cargo check` | 主题右键菜单和链路优化后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run tauri -- info` | 主题右键菜单和链路优化后 | Tauri 环境检测通过 | 通过 | 通过 |
 | `npm run tauri dev` | 主题右键菜单和链路优化后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止；仅有 MSVC linker stdout 警告 | 通过 |
+| `npm run build` | WebGL 终端渲染器后 | TypeScript/Vite 构建通过 | 构建通过 | 通过 |
+| `cargo fmt` | WebGL 终端渲染器后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `cargo check` | WebGL 终端渲染器后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run tauri -- info` | WebGL 终端渲染器后 | Tauri 环境检测通过 | 通过 | 通过 |
+| `npm run tauri dev` | WebGL 终端渲染器后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功并保持运行 10 秒，手动 Ctrl+C 停止；仅有 MSVC linker stdout 警告 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -169,12 +195,13 @@
 | 2026-09-10 | 终端输入和删除卡顿 | 1 | 前端批量合并发送，后端去掉每次写入 flush |
 | 2026-09-10 | 删除仍比较卡，自绘下拉不需要搜索 | 1 | 移除 picker 搜索路径，后端同步写改为 channel + writer 线程 |
 | 2026-09-10 | 终端右键菜单不符合主题，输入仍卡 | 1 | 改为主题自绘菜单，并继续优化真实串口输入/渲染链路 |
+| 2026-09-10 | 连续输入/删除仍卡，怀疑终端本身 | 1 | 切换 xterm 官方 WebGL renderer，并将 RX 改为字节流直接写入 xterm |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 9：主题右键菜单与真实输入链路优化 |
-| 我要去哪里？ | 等待用户实机验证主题右键菜单和连续输入/删除手感 |
+| 我在哪里？ | 完成阶段 10：终端渲染器性能修复 |
+| 我要去哪里？ | 等待用户实机验证 WebGL renderer 下连续输入/删除手感 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

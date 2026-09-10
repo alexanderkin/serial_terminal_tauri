@@ -9,6 +9,7 @@
 - 终端打字输入和删除卡顿，需要优化跨进程发送路径。
 - 用户进一步确认自绘下拉不需要搜索；连续删除仍比较卡，需要继续优化同步写入路径。
 - 终端区域右键菜单需要匹配应用主题色，输入/删除仍需继续优化，但不能使用此前被回滚的本地输入预览方案。
+- 连续输入和删除仍卡，用户判断是终端问题；允许在必要时换一种终端。
 
 ## 研究发现
 - 当前 Tauri 版前端终端是自研文本渲染，天然缺少完整 ANSI、IME、宽字符、滚动缓冲、选择和 resize 语义。
@@ -25,6 +26,10 @@
 - 当前前端输入队列对 Enter/Ctrl+C 等立即发送，但 Backspace/Delete/ESC 没有抢占已存在的延迟 flush；连续删除时仍可能被 timer 和前一个 invoke 串行放大。
 - RX 串口事件如果每包都直接 `terminal.write` 并立即更新统计 DOM，高波特率或终端文字满屏时会增加主线程绘制压力。
 - Rust writer 线程虽然已后台化，但每次 `recv` 后仍只写一个 Vec；短小输入包可在 writer 线程内 drain 合并后再 `write_all`，减少系统调用和驱动压力。
+- 本地 `@xterm/xterm` 主包默认使用 DOM renderer；源码注释明确 DOM renderer 是可靠 fallback，并不作为高性能路径。
+- 本地此前没有 `@xterm/addon-webgl`；xterm README 将 WebGL addon 描述为 GPU 加速 renderer，插件需要单独安装。
+- xterm public API 支持 `terminal.write(string | Uint8Array)`，因此串口 RX 不需要先在应用层 `TextDecoder` 成 JS 字符串再写入。
+- WebGL renderer 插件有 `onContextLoss` 事件，适合做失败回退，避免 WebGL2 不可用或上下文丢失导致终端不可用。
 
 ## 技术决策
 | 决策 | 理由 |
@@ -42,6 +47,8 @@
 | 终端右键菜单改为自绘主题菜单 | 浏览器默认 context menu 无法匹配主题，且交互项不可控 |
 | 控制输入允许抢占延迟 flush | Backspace/Delete/Enter/Ctrl+C/ESC 是交互反馈最敏感路径，应尽快进入真实串口写入队列 |
 | RX 输出和统计更新按动画帧合并 | 降低每包事件造成的 `terminal.write` 与 DOM textContent 更新频率 |
+| 优先切换 xterm 官方 WebGL renderer | 先替换渲染后端，不立刻换完整终端库，能最大程度保留现有功能和 API |
+| RX 输出改为 `Uint8Array` 写入 | 降低 JS 字符串分配/拼接，保留 xterm 的流式 UTF-8 处理 |
 
 ## 遇到的问题
 | 问题 | 解决方案 |
@@ -55,6 +62,7 @@
 | 删除仍比较卡 | 后端同步 `write_all` 改为后台 writer 线程，前端 invoke 只等待 channel 入队 |
 | 右键菜单不符合主题 | 使用固定定位的自绘菜单并按视口夹取位置 |
 | 输入仍比较卡且不能恢复本地预览 | 优化真实链路：前端抢占 flush、RX 帧合并、统计节流、后端 writer 合并小包 |
+| 连续输入/删除仍卡且怀疑终端本身 | 接入 `@xterm/addon-webgl`，使用 GPU renderer；若不可用自动回退 DOM |
 
 ## 资源
 - 本地 `serial_terminal` Tauri 项目。
@@ -66,6 +74,7 @@
 - 最新一轮已移除自绘下拉搜索框；列表仍使用主题滚动条和 fixed 浮层定位。
 - 最新问题聚焦终端右键菜单和真实输入链路性能；本轮不采用已被回滚的本地输入预览策略。
 - 主题右键菜单和真实链路优化后，`npm run build`、`cargo check`、`npm run tauri -- info` 与 `npm run tauri dev` 均通过；Rust 命令仍会输出已知路径 canonicalize 警告。
+- 本轮已安装 `@xterm/addon-webgl`，并通过 `npm run build`、`cargo check`、`npm run tauri -- info`、`npm run tauri dev`；Tauri dev 启动后保持运行 10 秒无初始化崩溃。
 
 ---
 *每执行2次查看/浏览器或搜索操作后更新此文件*
