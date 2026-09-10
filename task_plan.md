@@ -6,7 +6,7 @@
 
 ## 下一步
 
-Ghostty 终端替换已完成，等待用户实机验证连续输入/删除手感。
+证据驱动的输入/删除卡顿定位已完成，等待用户实机复测连续输入和连续删除手感。
 
 ## 当前阶段
 
@@ -99,6 +99,15 @@ Ghostty 终端替换已完成，等待用户实机验证连续输入/删除手�
 - [x] 提交到 `serial_terminal` 子仓库
 - **状态：** complete
 
+### 阶段 12：证据驱动输入/删除卡顿定位
+- [x] 使用 WebView2 CDP/Profiler 抓取 idle、终端输出、scrollback、RX 事件和真实键盘输入数据
+- [x] 证明 Ghostty 渲染在空闲、满屏输出、真实 Tauri RX 和 scrollback 压力下没有长任务
+- [x] 证明真实卡顿来自连续按键触发过多 `write_text` IPC，且单次 invoke 曾抖动到 480ms
+- [x] 调整前端串口发送策略：普通输入 12ms 合并、删除键 40ms 合并、最多 4 个写入 invoke 并发
+- [x] 移除所有临时调试接口，仅保留生产代码
+- [x] 构建、Rust 检查、Tauri info 和 Tauri dev 热重载验证
+- **状态：** complete
+
 ## 关键问题
 
 1. 终端核心必须使用成熟库处理 ANSI、IME、宽字符、滚动缓冲和选择，不能继续手写简化版。
@@ -123,6 +132,8 @@ Ghostty 终端替换已完成，等待用户实机验证连续输入/删除手�
 | 使用 xterm 官方 WebGL renderer | 当前主包默认 DOM renderer 是可靠 fallback，但高频回显和满屏更新性能弱；WebGL renderer 是 xterm 官方性能路径 |
 | RX 直接向 xterm 写入 `Uint8Array` | 避免 JS `TextDecoder` 和字符串拼接，把流式 UTF-8 解码交给 xterm 的输入解析器 |
 | 换用 `ghostty-web` | 用户实测 WebGL xterm 仍卡，需要替换完整终端核心；`ghostty-web` 提供 Ghostty WASM parser 和 canvas renderer，同时保留接近 xterm 的 API，迁移风险低于重写 |
+| 保留 Ghostty，优化串口发送节流 | CDP 证据显示 Ghostty 渲染不是卡顿根因；真实卡顿来自 `write_text` IPC 在连续按键下被放大 |
+| Backspace/Delete 不再立即 flush | 连续删除对实时性敏感但不应每个键一次 invoke；40ms 合并可明显降低 IPC 数量 |
 
 ## 遇到的错误
 
@@ -136,6 +147,7 @@ Ghostty 终端替换已完成，等待用户实机验证连续输入/删除手�
 | 终端右键菜单不符合主题且输入仍卡 | 1 | 新增主题自绘菜单；继续优化真实串口链路，不使用本地输入预览 |
 | 连续输入/删除仍卡，怀疑终端本身 | 1 | 切换 xterm 官方 WebGL renderer，并改为字节流直接写入终端 |
 | WebGL xterm 仍卡，用户要求换终端 | 1 | 切换到 `ghostty-web`，删除 xterm/WebGL 依赖，并按新库语义重做终端挂载 |
+| Ghostty 后连续输入/删除仍卡 | 1 | 用 CDP 和真实 COM5 输入链路定位到 `write_text` invoke 抖动与过密 flush；改为有限并发和删除键专用合并窗口 |
 
 ## 提交
 

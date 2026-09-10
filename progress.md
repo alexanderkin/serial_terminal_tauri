@@ -175,6 +175,22 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 12：证据驱动输入/删除卡顿定位
+- **状态：** complete
+- 执行的操作：
+  - 启动 Tauri dev 并打开 WebView2 远程调试端口，用 CDP/Profiler 分层抓取性能数据。
+  - 对 idle、合成终端输出、满 scrollback、真实 Tauri RX 事件、真实 COM5 输入和真实键盘事件分别压测。
+  - 确认 Ghostty 渲染在这些测试中没有持续长任务，空闲 5 秒 profile 主要处于 idle。
+  - 抓到真实键盘链路中 `write_text` invoke 曾出现 480ms 峰值；旧策略又让 Backspace/Delete 在真实按键间隔下接近一键一 invoke。
+  - 移除临时后端 debug command 和前端 debug API。
+  - 将普通串口输入合并窗口调为 12ms，Backspace/Delete 调为 40ms，并允许最多 4 个写入 invoke 并发消化积压。
+  - 运行前端构建、Rust 格式化/检查、Tauri info，并在 Tauri dev 热重载后的最终代码上确认无新错误。
+- 创建/修改的文件：
+  - `src/main.ts`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -210,6 +226,15 @@
 | `cargo check` | Ghostty 终端替换后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run tauri -- info` | Ghostty 终端替换后 | Tauri 环境检测通过 | 通过 | 通过 |
 | `npm run tauri dev` | Ghostty 终端替换后 | 启动到 Tauri exe 且无立即崩溃 | 两次启动均成功，最后一次保持运行 10 秒后停止；仅有 MSVC linker stdout 警告 | 通过 |
+| CDP idle profile | Ghostty 空闲态 5 秒 | 无持续渲染或长任务 | 约 4.86s idle，无持续 render loop | 通过 |
+| CDP 合成输出压测 | 1600 行、20000 行、满 scrollback | 渲染不产生长任务 | render 峰值低，未出现长任务 | 通过 |
+| CDP Tauri RX 压测 | 大包和 20000 个小包 `serial-data` | Tauri 事件桥不造成长任务 | 未出现长任务 | 通过 |
+| CDP 真实 COM5 输入 | 连续 ASCII/中文/删除 | 找到卡顿瓶颈 | 捕获到 `write_text` invoke 480ms 峰值 | 通过 |
+| CDP 删除节流复测 | 240 次 Backspace 连续重复 | 降低 invoke 密度和峰值 | flush 次数约从 240 降为 120，max 约 2.1ms，无长任务 | 通过 |
+| `npm run build` | 删除节流最终代码 | TypeScript/Vite 构建通过 | 构建通过；Vite 提示 Ghostty chunk 大小超过 500 kB | 通过 |
+| `cargo fmt` | 删除节流最终代码 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `cargo check` | 删除节流最终代码 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run tauri -- info` | 删除节流最终代码 | Tauri 环境检测通过 | 通过 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -224,12 +249,13 @@
 | 2026-09-10 | 终端右键菜单不符合主题，输入仍卡 | 1 | 改为主题自绘菜单，并继续优化真实串口输入/渲染链路 |
 | 2026-09-10 | 连续输入/删除仍卡，怀疑终端本身 | 1 | 切换 xterm 官方 WebGL renderer，并将 RX 改为字节流直接写入 xterm |
 | 2026-09-10 | WebGL xterm 仍卡，用户要求换终端 | 1 | 替换为 `ghostty-web` 并清理 xterm/WebGL 残留 |
+| 2026-09-10 | Ghostty 后连续输入/删除仍有卡死反馈 | 1 | 用 CDP 和真实 COM5 分层定位，确认是 `write_text` invoke 抖动被过密 flush 放大；改为删除键专用合并和有限并发写入 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 11：替换终端库 |
-| 我要去哪里？ | 等待用户实机验证 Ghostty 终端下连续输入/删除手感 |
+| 我在哪里？ | 完成阶段 12：证据驱动输入/删除卡顿定位 |
+| 我要去哪里？ | 提交本轮串口发送节流修复，并等待用户实机复测 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

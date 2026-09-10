@@ -11,6 +11,7 @@
 - 终端区域右键菜单需要匹配应用主题色，输入/删除仍需继续优化，但不能使用此前被回滚的本地输入预览方案。
 - 连续输入和删除仍卡，用户判断是终端问题；允许在必要时换一种终端。
 - WebGL xterm 方案实机仍卡，用户明确要求“换终端”。
+- Ghostty 终端替换后仍有卡死/卡顿反馈；用户要求先调试抓证据，再基于证据修改。
 
 ## 研究发现
 - 当前 Tauri 版前端终端是自研文本渲染，天然缺少完整 ANSI、IME、宽字符、滚动缓冲、选择和 resize 语义。
@@ -35,6 +36,11 @@
 - `ghostty-web` 的 `Terminal.open(parent)` 会把传入的父元素保存为 `terminal.element` 并在里面追加 canvas/textarea；应用重渲染时不能把 `terminal.element` 当作子节点再挂进新 host，否则会嵌套旧 host。
 - `ghostty-web` 的 `attachCustomKeyEventHandler` 返回值语义是 `true` 表示阻止默认处理；Ctrl+C 有选区时需要返回 `true`，普通输入返回 `false`。
 - `ghostty-web` 构建产物会将 WASM 以内联 data URL 形式打进 Vite bundle，本轮不需要额外复制 `.wasm` 静态资源。
+- WebView2 CDP idle profile 显示 5 秒内绝大部分时间处于 idle，Ghostty 空闲态没有持续渲染循环。
+- 合成终端输出、满 scrollback、真实 Tauri `serial-data` 事件和批量 Backspace 压测均没有产生长任务；终端渲染本身不是本轮卡死根因。
+- 真实 COM5 键盘链路中，连续按键触发的 `write_text` invoke 曾出现 480ms 单次抖动；调整并发后仍可出现 240ms 级别峰值，说明 IPC/后端写入返回时间会抖动。
+- 旧策略的 2ms 合并窗口加 Backspace/Delete 立即 flush，在真实按键间隔下几乎变成每个删除键一次 `write_text`，会把 IPC 抖动放大成明显卡顿。
+- 删除键专用 40ms 合并窗口后，连续 240 次 Backspace 的发送批次数从 240 次下降到约 120 次，串口 flush 总耗时和最大耗时明显下降，且无长任务。
 
 ## 技术决策
 | 决策 | 理由 |
@@ -56,6 +62,9 @@
 | RX 输出改为 `Uint8Array` 写入 | 降低 JS 字符串分配/拼接，保留 xterm 的流式 UTF-8 处理 |
 | 替换为 `ghostty-web` | 用户反馈 WebGL xterm 仍卡；Ghostty WASM parser + canvas renderer 能替换完整终端核心，同时继续复用当前串口桥接和 UI 外壳 |
 | 终端 DOM 改用持久化 surface | Ghostty 将 `open()` 入参作为终端根元素，重渲染 UI 时移动这个 surface 比重新 open 或挂载 `terminal.element` 更安全 |
+| 不继续盲目替换终端 | CDP 证据显示 Ghostty 渲染链路稳定，继续换终端不会命中本轮已抓到的卡顿点 |
+| 前端串口写入采用有限并发 | 允许最多 4 个 `write_text` invoke 并行消化积压，避免单个慢 invoke 把队列完全堵死 |
+| 删除输入使用更长 debounce | Backspace/Delete 连续重复时合并发送，降低 IPC 数量，同时保留真实串口发送而不是本地假预览 |
 
 ## 遇到的问题
 | 问题 | 解决方案 |
@@ -71,6 +80,7 @@
 | 输入仍比较卡且不能恢复本地预览 | 优化真实链路：前端抢占 flush、RX 帧合并、统计节流、后端 writer 合并小包 |
 | 连续输入/删除仍卡且怀疑终端本身 | 接入 `@xterm/addon-webgl`，使用 GPU renderer；若不可用自动回退 DOM |
 | WebGL xterm 仍卡 | 替换为 `ghostty-web`，清理 xterm/WebGL 依赖和内部 CSS，修正挂载和键盘拦截语义 |
+| Ghostty 后仍反馈卡死 | 通过 CDP profile、合成输出、真实 Tauri RX 和真实 COM5 键盘输入分层定位，确认主要瓶颈是 `write_text` 调用密度和 invoke 抖动，而不是终端渲染 |
 
 ## 资源
 - 本地 `serial_terminal` Tauri 项目。
@@ -84,6 +94,7 @@
 - 主题右键菜单和真实链路优化后，`npm run build`、`cargo check`、`npm run tauri -- info` 与 `npm run tauri dev` 均通过；Rust 命令仍会输出已知路径 canonicalize 警告。
 - 本轮已安装 `@xterm/addon-webgl`，并通过 `npm run build`、`cargo check`、`npm run tauri -- info`、`npm run tauri dev`；Tauri dev 启动后保持运行 10 秒无初始化崩溃。
 - 本轮开始替换为 `ghostty-web`；前端 `npm run build` 已通过，待继续做 Rust/Tauri 启动验证。
+- 本轮已完成证据驱动性能定位；所有临时调试命令和前端 debug API 已移除，最终生产改动仅保留串口发送节流策略。
 
 ---
 *每执行2次查看/浏览器或搜索操作后更新此文件*

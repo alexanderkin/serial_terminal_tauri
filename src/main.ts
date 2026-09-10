@@ -124,7 +124,9 @@ const fallbackFontFamilies = [
 
 const storageKey = "serial-terminal-settings-v1";
 const serialWriteChunkSize = 256;
-const serialWriteDelayMs = 2;
+const serialWriteDelayMs = 12;
+const serialDeleteWriteDelayMs = 40;
+const serialWriteMaxInFlight = 4;
 const terminalMenuMargin = 8;
 const savedSettings = readSavedSettings();
 const state: AppState = {
@@ -212,7 +214,7 @@ let resizeObserver: ResizeObserver | null = null;
 let fitQueued = false;
 let pendingSerialText = "";
 let serialFlushTimer: number | null = null;
-let serialWriteInFlight = false;
+let serialWritesInFlight = 0;
 let terminalContextMenu: TerminalContextMenuState | null = null;
 let serialOutputQueued = false;
 let pendingTerminalOutputChunks: Uint8Array[] = [];
@@ -968,11 +970,17 @@ function queueSerialText(text: string): void {
     shouldFlushImmediately(text) || pendingSerialText.length + text.length >= serialWriteChunkSize;
 
   pendingSerialText += text;
-  scheduleSerialFlush(shouldFlushNow ? 0 : serialWriteDelayMs);
+  scheduleSerialFlush(
+    shouldFlushNow ? 0 : isBackspaceInput(text) ? serialDeleteWriteDelayMs : serialWriteDelayMs,
+  );
 }
 
 function shouldFlushImmediately(text: string): boolean {
-  return /[\r\n\b\x1b\x7f\u0003\u0004\u001a]/.test(text);
+  return /[\r\n\x1b\u0003\u0004\u001a]/.test(text);
+}
+
+function isBackspaceInput(text: string): boolean {
+  return text.length > 0 && /^[\b]+$/.test(text);
 }
 
 function scheduleSerialFlush(delayMs: number): void {
@@ -992,16 +1000,22 @@ function scheduleSerialFlush(delayMs: number): void {
 }
 
 async function flushSerialText(): Promise<void> {
-  if (serialWriteInFlight || pendingSerialText.length === 0) {
+  if (pendingSerialText.length === 0 || serialWritesInFlight >= serialWriteMaxInFlight) {
     return;
   }
 
-  const text = pendingSerialText.slice(0, serialWriteChunkSize);
-  pendingSerialText = pendingSerialText.slice(text.length);
-  serialWriteInFlight = true;
+  while (pendingSerialText.length > 0 && serialWritesInFlight < serialWriteMaxInFlight) {
+    const text = pendingSerialText.slice(0, serialWriteChunkSize);
+    pendingSerialText = pendingSerialText.slice(text.length);
+    serialWritesInFlight += 1;
+    void writeSerialChunk(text);
+  }
+}
 
+async function writeSerialChunk(text: string): Promise<void> {
   try {
-    state.txBytes = await invoke<number>("write_text", { text });
+    const txBytes = await invoke<number>("write_text", { text });
+    state.txBytes = Math.max(state.txBytes, txBytes);
     requestStatsUpdate();
   } catch (error) {
     state.lastError = toMessage(error);
@@ -1009,8 +1023,8 @@ async function flushSerialText(): Promise<void> {
     terminal.writeln(`\x1b[31m${state.lastError}\x1b[0m`);
     renderApp();
   } finally {
-    serialWriteInFlight = false;
-    if (pendingSerialText.length > 0) {
+    serialWritesInFlight = Math.max(0, serialWritesInFlight - 1);
+    if (pendingSerialText.length > 0 && state.mode === "connected") {
       scheduleSerialFlush(0);
     }
   }
