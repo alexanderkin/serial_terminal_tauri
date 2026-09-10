@@ -261,7 +261,6 @@ select {
 select:focus,
 input:focus,
 button:focus-visible,
-.picker-search:focus,
 .picker-button:focus-visible {
   border-color: var(--accent);
 }
@@ -390,22 +389,6 @@ button:focus-visible,
   border-radius: 7px;
   background: #191919;
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
-}
-
-.picker-search {
-  width: 100%;
-  height: clamp(30px, calc(38px * var(--ui-scale)), 38px);
-  border: 0;
-  border-bottom: 1px solid var(--border);
-  outline: 0;
-  padding: 0 calc(12px * var(--ui-scale));
-  background: #202020;
-  color: var(--text);
-  font-size: clamp(10px, calc(13px * var(--ui-scale)), 13px);
-}
-
-.picker-search::placeholder {
-  color: #777777;
 }
 
 .picker-options {

@@ -81,7 +81,7 @@
 - **状态：** complete
 - 执行的操作：
   - 将串口和波特率从原生 `select` 替换为与字体一致的自绘 picker。
-  - picker 统一支持搜索、Enter 选择首项、Esc 收起、点击外部收起。
+  - picker 当时统一支持搜索、Enter 选择首项、Esc 收起、点击外部收起，后续阶段 8 已按用户要求移除搜索。
   - picker 使用 fixed 浮层，并按按钮位置/窗口剩余空间计算向上或向下展开，保证完整显示在窗口内。
   - 默认窗口尺寸改为 1500×960。
   - 终端输入改为短批量发送队列，减少每个按键一次 Tauri invoke。
@@ -92,6 +92,23 @@
   - `src/styles.css`
   - `src-tauri/src/lib.rs`
   - `src-tauri/tauri.conf.json`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
+### 阶段 8：简化下拉与异步串口写入
+- **状态：** complete
+- 执行的操作：
+  - 移除自绘 picker 的搜索框、查询状态、过滤函数、搜索占位符和搜索 CSS。
+  - 保留自绘下拉的主题滚动条、fixed 浮层、向上/向下展开和窗口内夹取定位。
+  - Rust 串口后端增加 writer channel 和后台 writer 线程。
+  - `write_text` 命令改为只把字节入队并更新 TX 统计，不再直接同步 `write_all`。
+  - writer 线程写入失败时继续通过 `serial-error` 通知前端。
+  - 运行构建、后端检查、Tauri info 和 dev 启动验证。
+- 创建/修改的文件：
+  - `src/main.ts`
+  - `src/styles.css`
+  - `src-tauri/src/lib.rs`
   - `task_plan.md`
   - `findings.md`
   - `progress.md`
@@ -111,6 +128,11 @@
 | `cargo check` | 去掉写入 flush 后 | 编译检查通过 | 通过 | 通过 |
 | `npm run tauri -- info` | 窗口 1500×960 后 | Tauri 环境检测通过 | 通过 | 通过 |
 | `npm run tauri dev` | 统一 picker 后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止 | 通过 |
+| `cargo fmt` | 异步 writer 改动后 | Rust 格式化完成 | 仅有路径 canonicalize 警告 | 通过 |
+| `npm run build` | 移除 picker 搜索后 | TypeScript/Vite 构建通过 | 构建通过 | 通过 |
+| `cargo check` | writer channel 后端 | 编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run tauri -- info` | writer channel 后端 | Tauri 环境检测通过 | 通过 | 通过 |
+| `npm run tauri dev` | 异步写入和无搜索 picker 后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -121,12 +143,13 @@
 | 2026-09-10 | 字体搜索范围太少且原生下拉滚动条不匹配主题 | 1 | 后端枚举系统字体，前端自绘搜索下拉和主题滚动条 |
 | 2026-09-10 | 端口/波特率仍为原生下拉，且下拉可能超窗 | 1 | 统一 fixed 自绘 picker，按视口空间向上/向下定位 |
 | 2026-09-10 | 终端输入和删除卡顿 | 1 | 前端批量合并发送，后端去掉每次写入 flush |
+| 2026-09-10 | 删除仍比较卡，自绘下拉不需要搜索 | 1 | 移除 picker 搜索路径，后端同步写改为 channel + writer 线程 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成 |
-| 我要去哪里？ | 等待用户实机验证所有下拉和串口输入手感 |
+| 我在哪里？ | 完成阶段 8：简化下拉与异步串口写入 |
+| 我要去哪里？ | 等待用户实机验证无搜索下拉和连续删除/输入手感 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

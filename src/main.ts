@@ -43,7 +43,6 @@ interface AppState {
   lastError: string;
   fontFamily: string;
   activePicker: PickerId | null;
-  pickerQuery: string;
   pickerPosition: DropdownPosition | null;
   fontSize: number;
   lineSpacing: number;
@@ -100,7 +99,6 @@ const state: AppState = {
   lastError: "",
   fontFamily: savedSettings.fontFamily ?? fallbackFontFamilies[0],
   activePicker: null,
-  pickerQuery: "",
   pickerPosition: null,
   fontSize: savedSettings.fontSize ?? 18,
   lineSpacing: savedSettings.lineSpacing ?? 1,
@@ -415,17 +413,7 @@ function renderPickerPortal(): string {
       class="picker-menu ${position.placement}"
       style="left: ${position.left}px; top: ${position.top}px; width: ${position.width}px; max-height: ${position.maxHeight}px"
     >
-      <input
-        id="picker-search"
-        class="picker-search"
-        type="search"
-        placeholder="${escapeAttribute(pickerSearchPlaceholder(state.activePicker))}"
-        value="${escapeAttribute(state.pickerQuery)}"
-      />
-      <div id="picker-options" class="picker-options" style="max-height: ${Math.max(
-        60,
-        position.maxHeight - 42,
-      )}px" role="listbox">
+      <div id="picker-options" class="picker-options" style="max-height: ${position.maxHeight}px" role="listbox">
         ${renderPickerOptions()}
       </div>
     </div>
@@ -433,9 +421,9 @@ function renderPickerPortal(): string {
 }
 
 function renderPickerOptions(): string {
-  const options = filteredPickerOptions();
+  const options = state.activePicker ? pickerOptions(state.activePicker) : [];
   if (options.length === 0) {
-    return `<div class="picker-empty">没有匹配项</div>`;
+    return `<div class="picker-empty">暂无选项</div>`;
   }
 
   return options
@@ -462,36 +450,6 @@ function bindPickerEvents(): void {
     });
   });
 
-  const search = document.querySelector<HTMLInputElement>("#picker-search");
-  search?.addEventListener("input", () => {
-    state.pickerQuery = search.value;
-    renderPickerOptionList();
-  });
-  search?.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      closePicker();
-      renderApp();
-      return;
-    }
-
-    if (event.key === "Enter") {
-      const firstOption = filteredPickerOptions()[0];
-      if (firstOption && state.activePicker) {
-        selectPickerOption(state.activePicker, firstOption.value);
-      }
-    }
-  });
-
-  bindPickerOptionButtons();
-}
-
-function renderPickerOptionList(): void {
-  const list = document.querySelector<HTMLDivElement>("#picker-options");
-  if (!list) {
-    return;
-  }
-
-  list.innerHTML = renderPickerOptions();
   bindPickerOptionButtons();
 }
 
@@ -514,15 +472,12 @@ function togglePicker(id: PickerId, button: HTMLElement): void {
   }
 
   state.activePicker = id;
-  state.pickerQuery = "";
   state.pickerPosition = calculatePickerPosition(button, pickerOptions(id).length);
   renderApp();
-  focusPickerSearch();
 }
 
 function closePicker(): void {
   state.activePicker = null;
-  state.pickerQuery = "";
   state.pickerPosition = null;
 }
 
@@ -567,20 +522,6 @@ function pickerOptions(id: PickerId): PickerOption[] {
   }));
 }
 
-function filteredPickerOptions(): PickerOption[] {
-  if (!state.activePicker) {
-    return [];
-  }
-
-  const query = state.pickerQuery.trim().toLocaleLowerCase();
-  const options = pickerOptions(state.activePicker);
-  if (query.length === 0) {
-    return options;
-  }
-
-  return options.filter((option) => option.label.toLocaleLowerCase().includes(query));
-}
-
 function isPickerOptionActive(option: PickerOption): boolean {
   if (state.activePicker === "port") {
     return option.value === state.config.port_name;
@@ -591,25 +532,14 @@ function isPickerOptionActive(option: PickerOption): boolean {
   return option.value === state.fontFamily;
 }
 
-function pickerSearchPlaceholder(id: PickerId): string {
-  if (id === "port") {
-    return "搜索串口";
-  }
-  if (id === "baud") {
-    return "搜索波特率";
-  }
-  return "搜索字体";
-}
-
 function calculatePickerPosition(button: HTMLElement, optionCount: number): DropdownPosition {
   const rect = button.getBoundingClientRect();
   const scale = currentScale();
   const margin = 8;
   const gap = 6;
-  const searchHeight = 38 * scale;
   const rowHeight = 34 * scale;
   const menuPadding = 8 * scale;
-  const desiredHeight = searchHeight + Math.min(Math.max(optionCount, 1), 7) * rowHeight + menuPadding;
+  const desiredHeight = Math.min(Math.max(optionCount, 1), 8) * rowHeight + menuPadding;
   const width = Math.min(
     Math.max(rect.width, Math.min(260, window.innerWidth - margin * 2)),
     window.innerWidth - margin * 2,
@@ -630,14 +560,6 @@ function calculatePickerPosition(button: HTMLElement, optionCount: number): Drop
     maxHeight,
     placement: openUp ? "up" : "down",
   };
-}
-
-function focusPickerSearch(): void {
-  requestAnimationFrame(() => {
-    const search = document.querySelector<HTMLInputElement>("#picker-search");
-    search?.focus();
-    search?.select();
-  });
 }
 
 function applySerialSetting(setting: string, value: string): void {
@@ -1062,6 +984,15 @@ document.addEventListener("pointerdown", (event) => {
 
   const target = event.target;
   if (target instanceof Element && (target.closest(".picker-anchor") || target.closest("#picker-portal"))) {
+    return;
+  }
+
+  closePicker();
+  renderApp();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !state.activePicker) {
     return;
   }
 

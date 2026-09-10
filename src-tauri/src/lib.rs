@@ -5,7 +5,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -19,9 +19,10 @@ struct SerialManager {
 
 #[derive(Default)]
 struct SerialState {
-    port: Option<Box<dyn SerialPort>>,
     reader_stop: Option<Arc<AtomicBool>>,
     reader: Option<JoinHandle<()>>,
+    writer_tx: Option<mpsc::Sender<Vec<u8>>>,
+    writer: Option<JoinHandle<()>>,
     tx_bytes: u64,
 }
 
@@ -87,16 +88,19 @@ fn connect(
         .try_clone()
         .map_err(|error| format!("创建串口读取通道失败: {error}"))?;
 
+    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let reader_handle = spawn_reader(app.clone(), reader_port, Arc::clone(&reader_stop));
+    let writer_handle = spawn_writer(app, port, writer_rx);
+
     let mut state = manager
         .inner
         .lock()
         .map_err(|_| "串口状态锁已损坏".to_string())?;
-    let reader_stop = Arc::new(AtomicBool::new(false));
-    let reader_handle = spawn_reader(app, reader_port, Arc::clone(&reader_stop));
-
-    state.port = Some(port);
     state.reader_stop = Some(reader_stop);
     state.reader = Some(reader_handle);
+    state.writer_tx = Some(writer_tx);
+    state.writer = Some(writer_handle);
     state.tx_bytes = 0;
 
     Ok(())
@@ -114,19 +118,21 @@ fn disconnect(manager: State<'_, SerialManager>) -> Result<(), String> {
 
 #[tauri::command]
 fn write_text(manager: State<'_, SerialManager>, text: String) -> Result<u64, String> {
+    let bytes = text.into_bytes();
+    let byte_count = bytes.len() as u64;
     let mut state = manager
         .inner
         .lock()
         .map_err(|_| "串口状态锁已损坏".to_string())?;
-    let bytes = text.as_bytes();
-    let port = state
-        .port
-        .as_mut()
+    let writer_tx = state
+        .writer_tx
+        .as_ref()
         .ok_or_else(|| "串口未连接".to_string())?;
 
-    port.write_all(bytes)
-        .map_err(|error| format!("写入串口失败: {error}"))?;
-    state.tx_bytes += bytes.len() as u64;
+    writer_tx
+        .send(bytes)
+        .map_err(|_| "串口写入通道已关闭".to_string())?;
+    state.tx_bytes += byte_count;
 
     Ok(state.tx_bytes)
 }
@@ -164,12 +170,40 @@ fn spawn_reader(
     })
 }
 
+fn spawn_writer(
+    app: AppHandle,
+    mut port: Box<dyn SerialPort>,
+    writer_rx: mpsc::Receiver<Vec<u8>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(bytes) = writer_rx.recv() {
+            if bytes.is_empty() {
+                continue;
+            }
+
+            if let Err(error) = port.write_all(&bytes) {
+                let _ = app.emit(
+                    "serial-error",
+                    SerialError {
+                        message: format!("串口写入失败: {error}"),
+                    },
+                );
+                break;
+            }
+        }
+    })
+}
+
 fn close_locked(state: &mut SerialState) {
     if let Some(reader_stop) = state.reader_stop.take() {
         reader_stop.store(true, Ordering::Relaxed);
     }
 
-    state.port.take();
+    state.writer_tx.take();
+
+    if let Some(writer) = state.writer.take() {
+        let _ = writer.join();
+    }
 
     if let Some(reader) = state.reader.take() {
         let _ = reader.join();
