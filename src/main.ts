@@ -124,9 +124,7 @@ const fallbackFontFamilies = [
 
 const storageKey = "serial-terminal-settings-v1";
 const serialWriteChunkSize = 256;
-const serialWriteDelayMs = 12;
-const serialDeleteWriteDelayMs = 40;
-const serialWriteMaxInFlight = 4;
+const serialWriteMaxInFlight = 8;
 const terminalMenuMargin = 8;
 const savedSettings = readSavedSettings();
 const state: AppState = {
@@ -213,7 +211,6 @@ let terminalInputDisposable: { dispose(): void } | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let fitQueued = false;
 let pendingSerialText = "";
-let serialFlushTimer: number | null = null;
 let serialWritesInFlight = 0;
 let terminalContextMenu: TerminalContextMenuState | null = null;
 let pendingStatsUpdate = false;
@@ -959,40 +956,11 @@ function queueSerialText(text: string): void {
     return;
   }
 
-  const shouldFlushNow =
-    shouldFlushImmediately(text) || pendingSerialText.length + text.length >= serialWriteChunkSize;
-
   pendingSerialText += text;
-  scheduleSerialFlush(
-    shouldFlushNow ? 0 : isBackspaceInput(text) ? serialDeleteWriteDelayMs : serialWriteDelayMs,
-  );
+  flushSerialText();
 }
 
-function shouldFlushImmediately(text: string): boolean {
-  return /[\r\n\x1b\u0003\u0004\u001a]/.test(text);
-}
-
-function isBackspaceInput(text: string): boolean {
-  return text.length > 0 && /^[\b]+$/.test(text);
-}
-
-function scheduleSerialFlush(delayMs: number): void {
-  if (delayMs === 0 && serialFlushTimer !== null) {
-    window.clearTimeout(serialFlushTimer);
-    serialFlushTimer = null;
-  }
-
-  if (serialFlushTimer !== null) {
-    return;
-  }
-
-  serialFlushTimer = window.setTimeout(() => {
-    serialFlushTimer = null;
-    void flushSerialText();
-  }, delayMs);
-}
-
-async function flushSerialText(): Promise<void> {
+function flushSerialText(): void {
   if (pendingSerialText.length === 0 || serialWritesInFlight >= serialWriteMaxInFlight) {
     return;
   }
@@ -1018,17 +986,13 @@ async function writeSerialChunk(text: string): Promise<void> {
   } finally {
     serialWritesInFlight = Math.max(0, serialWritesInFlight - 1);
     if (pendingSerialText.length > 0 && state.mode === "connected") {
-      scheduleSerialFlush(0);
+      flushSerialText();
     }
   }
 }
 
 function clearPendingSerialText(): void {
   pendingSerialText = "";
-  if (serialFlushTimer !== null) {
-    window.clearTimeout(serialFlushTimer);
-    serialFlushTimer = null;
-  }
 }
 
 function normalizeTerminalInput(data: string): string {

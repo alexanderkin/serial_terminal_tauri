@@ -209,6 +209,24 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 14：删除与快速输入低延迟发送
+- **状态：** complete
+- 执行的操作：
+  - 读取用户反馈，确认回车逐行刷新已解决，剩余问题是删除和快速输入仍成块。
+  - 复查前端发送链路，确认 Backspace 仍使用 40ms debounce，普通输入使用 12ms debounce。
+  - 复查 Rust writer，确认后台线程会 `try_recv` drain 小包并合并到一次 `write_all`。
+  - 尝试直接打开 COM5 做删除测试，但当前 `serial_terminal.exe` 正在运行并占用 COM5；为避免打断用户实例，没有强行关闭。
+  - 移除前端输入 debounce 和 timer，`queueSerialText` 收到数据后立即 `flushSerialText()`。
+  - 写入 invoke 并发上限从 4 提升到 8，减少短时间输入积压。
+  - 移除 Rust writer 小包合并，一个 channel 包对应一次后台 `write_all`。
+  - 运行前端构建、Rust 格式化/检查和 Tauri info。
+- 创建/修改的文件：
+  - `src/main.ts`
+  - `src-tauri/src/lib.rs`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -259,6 +277,11 @@
 | `cargo check` | 低延迟 RX 改动后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run tauri -- info` | 低延迟 RX 改动后 | Tauri 环境检测通过 | 通过 | 通过 |
 | `npm run tauri dev` | 低延迟 RX 改动后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止；仅有 MSVC linker stdout 警告 | 通过 |
+| 直接 COM5 删除测试 | 快速输入和 Backspace | 验证硬件是否逐键响应 | COM5 被正在运行的 `serial_terminal.exe` 占用，未强行关闭 | 跳过 |
+| `npm run build` | 低延迟 TX 改动后 | TypeScript/Vite 构建通过 | 构建通过；Vite 提示 Ghostty chunk 大小超过 500 kB | 通过 |
+| `cargo fmt` | 低延迟 TX 改动后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `cargo check` | 低延迟 TX 改动后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run tauri -- info` | 低延迟 TX 改动后 | Tauri 环境检测通过 | 通过 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -275,12 +298,13 @@
 | 2026-09-10 | WebGL xterm 仍卡，用户要求换终端 | 1 | 替换为 `ghostty-web` 并清理 xterm/WebGL 残留 |
 | 2026-09-10 | Ghostty 后连续输入/删除仍有卡死反馈 | 1 | 用 CDP 和真实 COM5 分层定位，确认是 `write_text` invoke 抖动被过密 flush 放大；改为删除键专用合并和有限并发写入 |
 | 2026-09-10 | 按住回车时输出成段刷新 | 1 | 直接 COM5 测试证明硬件逐行返回，改为低延迟 reader 和前端即时写终端 |
+| 2026-09-10 | 删除和快速输入仍成块 | 1 | 移除前端输入 debounce 和后端 writer drain，改为按键级低延迟发送 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 13：回车连续输出成段刷新定位 |
-| 我要去哪里？ | 提交本轮低延迟 RX 修复，并等待用户实机复测 |
+| 我在哪里？ | 完成阶段 14：删除与快速输入低延迟发送 |
+| 我要去哪里？ | 提交本轮低延迟 TX 修复，并等待用户实机复测 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

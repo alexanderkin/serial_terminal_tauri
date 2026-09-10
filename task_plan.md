@@ -6,7 +6,7 @@
 
 ## 下一步
 
-回车连续输出成段刷新问题已按证据修复，等待用户实机复测按住回车时的显示连续性。
+删除和快速输入成块问题已按发送链路修复，等待用户实机复测连续删除和快速输入手感。
 
 ## 当前阶段
 
@@ -117,6 +117,15 @@
 - [x] 构建、Rust 检查、Tauri info 和 Tauri dev 启动验证
 - **状态：** complete
 
+### 阶段 14：删除与快速输入低延迟发送
+- [x] 确认回车 RX 刷新已解决，剩余问题集中在 TX 发送侧
+- [x] 定位删除成块来自前端 Backspace 40ms debounce 和后端 writer 小包 drain 合并
+- [x] 移除前端输入 timer/debounce，`onData` 到达后立即尝试发送
+- [x] 写入 invoke 并发上限从 4 提升到 8，降低短时间积压后被切成大块的概率
+- [x] 移除 Rust writer 的 `try_recv` 合并逻辑，一个 `write_text` 入队对应一次后台 `write_all`
+- [x] 构建、Rust 格式化/检查和 Tauri info 验证
+- **状态：** complete
+
 ## 关键问题
 
 1. 终端核心必须使用成熟库处理 ANSI、IME、宽字符、滚动缓冲和选择，不能继续手写简化版。
@@ -144,6 +153,7 @@
 | 保留 Ghostty，优化串口发送节流 | CDP 证据显示 Ghostty 渲染不是卡顿根因；真实卡顿来自 `write_text` IPC 在连续按键下被放大 |
 | Backspace/Delete 不再立即 flush | 连续删除对实时性敏感但不应每个键一次 invoke；40ms 合并可明显降低 IPC 数量 |
 | 串口 RX 走低延迟路径 | 直接 COM5 测试证明硬件可一行一行返回，应用不应再用 50ms 大读缓冲和前端 rAF 合并把多行攒成一段 |
+| 串口 TX 走低延迟路径 | 删除和快速输入是交互输入，不能再用 40ms debounce 或 writer drain 把按键合并成块 |
 
 ## 遇到的错误
 
@@ -159,6 +169,7 @@
 | WebGL xterm 仍卡，用户要求换终端 | 1 | 切换到 `ghostty-web`，删除 xterm/WebGL 依赖，并按新库语义重做终端挂载 |
 | Ghostty 后连续输入/删除仍卡 | 1 | 用 CDP 和真实 COM5 输入链路定位到 `write_text` invoke 抖动与过密 flush；改为有限并发和删除键专用合并窗口 |
 | 按住回车时输出成段刷新 | 1 | 直接 COM5 测试确认硬件逐行返回；改为低延迟 reader 和前端即时写终端 |
+| 删除和快速输入仍成块 | 1 | 移除前端输入 debounce 和后端 writer 小包合并，改为按键级低延迟发送 |
 
 ## 提交
 
