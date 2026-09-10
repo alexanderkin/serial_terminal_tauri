@@ -359,78 +359,35 @@ output {
 .terminal-panel {
   min-width: 0;
   min-height: 0;
-  background: var(--terminal);
-}
-
-.terminal-screen {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  overflow: auto;
+  overflow: hidden;
   padding: calc(16px * var(--ui-scale));
   background: var(--terminal);
-  color: #d7d7d7;
+}
+
+.terminal-host {
+  width: 100%;
+  height: 100%;
+  background: var(--terminal);
   outline: 0;
-  white-space: pre;
-  user-select: none;
+}
+
+.terminal-host .xterm {
+  width: 100%;
+  height: 100%;
+}
+
+.terminal-host .xterm-viewport {
+  background: transparent !important;
   scrollbar-color: #7b7b7b transparent;
   scrollbar-width: thin;
+}
+
+.terminal-host .xterm-screen {
+  width: 100% !important;
+}
+
+.terminal-host .xterm-rows {
   font-variant-ligatures: none;
-}
-
-.terminal-lines {
-  min-width: max-content;
-}
-
-.terminal-spacer {
-  width: 1px;
-  min-width: 1px;
-}
-
-.terminal-line {
-  min-height: 1em;
-  white-space: pre;
-}
-
-.terminal-line.whole-selected {
-  background: var(--selection);
-  color: #ffffff;
-}
-
-.inline-selected {
-  background: var(--selection);
-  color: #ffffff;
-}
-
-.terminal-caret {
-  display: inline-block;
-  width: 0.6ch;
-  height: 1em;
-  border-left: 2px solid #f1f1f1;
-  vertical-align: -0.12em;
-  animation: caret-blink 1s steps(1, end) infinite;
-}
-
-#terminal-input {
-  position: absolute;
-  left: 0;
-  bottom: 0;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  border: 0;
-  outline: 0;
-  resize: none;
-  opacity: 0;
-  pointer-events: none;
-  background: transparent;
-  color: transparent;
-}
-
-@keyframes caret-blink {
-  50% {
-    opacity: 0;
-  }
 }
 
 @media (max-width: 940px) {

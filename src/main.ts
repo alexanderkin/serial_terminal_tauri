@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 
 type ConnectionMode = "disconnected" | "connecting" | "connected" | "error";
 type Parity = "none" | "even" | "odd";
@@ -21,11 +24,6 @@ interface SerialErrorPayload {
   message: string;
 }
 
-interface SelectionPoint {
-  row: number;
-  col: number;
-}
-
 interface AppState {
   ports: string[];
   config: SerialConfig;
@@ -36,11 +34,13 @@ interface AppState {
   fontFamily: string;
   fontSize: number;
   lineSpacing: number;
-  lines: string[];
-  cursorCol: number;
-  autoFollow: boolean;
-  selectionAnchor: SelectionPoint | null;
-  selectionFocus: SelectionPoint | null;
+}
+
+interface SavedSettings {
+  config?: Partial<SerialConfig>;
+  fontFamily?: string;
+  fontSize?: number;
+  lineSpacing?: number;
 }
 
 interface SegmentOption {
@@ -55,52 +55,95 @@ const baudRates = [
 ];
 
 const fontFamilies = [
-  "JetBrainsMonoNerdFontMono-Regular",
-  "JetBrains Mono",
   "Cascadia Mono",
   "Cascadia Code",
+  "JetBrains Mono",
+  "JetBrainsMonoNerdFontMono-Regular",
   "Consolas",
   "Microsoft YaHei UI",
   "monospace",
 ];
 
-const maxTerminalLines = 100000;
-const decoder = new TextDecoder("utf-8");
-const appRoot = document.querySelector<HTMLDivElement>("#app");
-
-if (!appRoot) {
-  throw new Error("Missing #app root");
-}
-
-const app: HTMLDivElement = appRoot;
-
+const storageKey = "serial-terminal-settings-v1";
+const savedSettings = readSavedSettings();
 const state: AppState = {
   ports: [],
   config: {
-    port_name: "",
-    baud_rate: 1500000,
-    data_bits: 8,
-    parity: "none",
-    stop_bits: 1,
+    port_name: savedSettings.config?.port_name ?? "",
+    baud_rate: savedSettings.config?.baud_rate ?? 1500000,
+    data_bits: savedSettings.config?.data_bits ?? 8,
+    parity: savedSettings.config?.parity ?? "none",
+    stop_bits: savedSettings.config?.stop_bits ?? 1,
   },
   mode: "disconnected",
   rxBytes: 0,
   txBytes: 0,
   lastError: "",
-  fontFamily: fontFamilies[0],
-  fontSize: 24,
-  lineSpacing: 1,
-  lines: [""],
-  cursorCol: 0,
-  autoFollow: true,
-  selectionAnchor: null,
-  selectionFocus: null,
+  fontFamily: savedSettings.fontFamily ?? fontFamilies[0],
+  fontSize: savedSettings.fontSize ?? 18,
+  lineSpacing: savedSettings.lineSpacing ?? 1,
 };
 
-let ansiEscapeState: "none" | "escape" | "sequence" = "none";
-let terminalRenderQueued = false;
-let pointerSelecting = false;
-let cellWidth = 12;
+const appRoot = document.querySelector<HTMLDivElement>("#app");
+if (!appRoot) {
+  throw new Error("Missing #app root");
+}
+const app: HTMLDivElement = appRoot;
+
+const serialDecoder = new TextDecoder("utf-8");
+const fitAddon = new FitAddon();
+const terminal = new Terminal({
+  allowProposedApi: false,
+  convertEol: false,
+  cursorBlink: true,
+  cursorStyle: "bar",
+  disableStdin: false,
+  drawBoldTextInBrightColors: false,
+  fontFamily: terminalFontFamily(),
+  fontSize: state.fontSize,
+  lineHeight: state.lineSpacing,
+  scrollback: 100000,
+  theme: {
+    background: "#050505",
+    foreground: "#d7d7d7",
+    cursor: "#f1f1f1",
+    cursorAccent: "#050505",
+    selectionBackground: "#264f78",
+    black: "#0c0c0c",
+    red: "#c50f1f",
+    green: "#13a10e",
+    yellow: "#c19c00",
+    blue: "#0037da",
+    magenta: "#881798",
+    cyan: "#3a96dd",
+    white: "#cccccc",
+    brightBlack: "#767676",
+    brightRed: "#e74856",
+    brightGreen: "#16c60c",
+    brightYellow: "#f9f1a5",
+    brightBlue: "#3b78ff",
+    brightMagenta: "#b4009e",
+    brightCyan: "#61d6d6",
+    brightWhite: "#f2f2f2",
+  },
+});
+
+terminal.loadAddon(fitAddon);
+terminal.attachCustomKeyEventHandler((event) => {
+  if (event.type === "keydown" && event.ctrlKey && event.key.toLowerCase() === "c") {
+    if (terminal.hasSelection()) {
+      copySelection(true);
+      return false;
+    }
+  }
+
+  return true;
+});
+
+let terminalHost: HTMLDivElement | null = null;
+let terminalInputDisposable: { dispose(): void } | null = null;
+let resizeObserver: ResizeObserver | null = null;
+let fitQueued = false;
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
@@ -110,12 +153,13 @@ function renderApp(): void {
       <header class="topbar">
         <div class="brand">
           <div class="brand-title">Serial Terminal</div>
-          <div class="brand-subtitle">EUI-NEO · C++23 · 串口终端</div>
+          <div class="brand-subtitle">Rust · Tauri · 串口终端</div>
         </div>
         <div class="terminal-hint">聚焦终端直接输入 · Enter=CR · Ctrl+C=中断</div>
         <div class="topbar-actions">
           <span id="rx-stat" class="metric">RX ${formatBytes(state.rxBytes)}</span>
           <span id="tx-stat" class="metric">TX ${formatBytes(state.txBytes)}</span>
+          <button id="copy-terminal" class="ghost-button" type="button">复制</button>
           <button id="clear-terminal" class="ghost-button" type="button">清空</button>
           <div class="status-pill ${statusTone()}">
             <span class="status-dot"></span>
@@ -213,43 +257,76 @@ function renderApp(): void {
               <span>字号</span>
               <div class="range-row">
                 <input id="font-size" type="range" min="12" max="34" step="1" value="${state.fontSize}" />
-                <output>${state.fontSize}px</output>
+                <output id="font-size-output">${state.fontSize}px</output>
               </div>
             </label>
             <label class="field range-field">
               <span>行距</span>
               <div class="range-row">
                 <input id="line-spacing" type="range" min="0.9" max="1.6" step="0.05" value="${state.lineSpacing}" />
-                <output>${state.lineSpacing.toFixed(2)}</output>
+                <output id="line-spacing-output">${state.lineSpacing.toFixed(2)}</output>
               </div>
             </label>
           </section>
         </aside>
 
         <section class="terminal-panel">
-          <div id="terminal-screen" class="terminal-screen" tabindex="0" role="textbox" aria-label="串口终端">
-            <div id="terminal-lines" class="terminal-lines"></div>
-            <textarea id="terminal-input" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
-          </div>
+          <div id="terminal-host" class="terminal-host"></div>
         </section>
       </main>
     </div>
   `;
 
   bindChromeEvents();
-  renderTerminal(false);
+  attachTerminal();
   updateStats();
+}
+
+function attachTerminal(): void {
+  const host = document.querySelector<HTMLDivElement>("#terminal-host");
+  if (!host || host === terminalHost) {
+    return;
+  }
+
+  terminalHost = host;
+  if (terminal.element) {
+    host.replaceChildren(terminal.element);
+  } else {
+    terminal.open(host);
+  }
+  terminal.focus();
+  queueFit();
+
+  resizeObserver?.disconnect();
+  resizeObserver = new ResizeObserver(() => {
+    queueFit();
+  });
+  resizeObserver.observe(host);
+
+  terminalInputDisposable?.dispose();
+  terminalInputDisposable = terminal.onData((data) => {
+    void sendText(normalizeTerminalInput(data));
+  });
+
+  host.addEventListener("contextmenu", (event) => {
+    if (terminal.hasSelection()) {
+      event.preventDefault();
+      copySelection(true);
+    }
+  });
 }
 
 function bindChromeEvents(): void {
   const portSelect = document.querySelector<HTMLSelectElement>("#port-select");
   portSelect?.addEventListener("change", () => {
     state.config.port_name = portSelect.value;
+    saveSettings();
   });
 
   const baudSelect = document.querySelector<HTMLSelectElement>("#baud-select");
   baudSelect?.addEventListener("change", () => {
     state.config.baud_rate = Number(baudSelect.value);
+    saveSettings();
   });
 
   document.querySelector("#refresh-ports")?.addEventListener("click", () => {
@@ -260,8 +337,13 @@ function bindChromeEvents(): void {
     void toggleConnection();
   });
 
+  document.querySelector("#copy-terminal")?.addEventListener("click", () => {
+    copySelection();
+  });
+
   document.querySelector("#clear-terminal")?.addEventListener("click", () => {
-    clearTerminal();
+    terminal.clear();
+    terminal.focus();
   });
 
   document.querySelectorAll<HTMLButtonElement>("[data-setting]").forEach((button) => {
@@ -277,40 +359,25 @@ function bindChromeEvents(): void {
   const fontSelect = document.querySelector<HTMLSelectElement>("#font-select");
   fontSelect?.addEventListener("change", () => {
     state.fontFamily = fontSelect.value;
-    renderTerminal(false);
+    saveSettings();
+    applyTerminalOptions();
   });
 
   const fontSize = document.querySelector<HTMLInputElement>("#font-size");
   fontSize?.addEventListener("input", () => {
     state.fontSize = Number(fontSize.value);
-    renderApp();
+    updateOutput("#font-size-output", `${state.fontSize}px`);
+    saveSettings();
+    applyTerminalOptions();
   });
 
   const lineSpacing = document.querySelector<HTMLInputElement>("#line-spacing");
   lineSpacing?.addEventListener("input", () => {
     state.lineSpacing = Number(lineSpacing.value);
-    renderApp();
+    updateOutput("#line-spacing-output", state.lineSpacing.toFixed(2));
+    saveSettings();
+    applyTerminalOptions();
   });
-
-  const terminalScreen = document.querySelector<HTMLDivElement>("#terminal-screen");
-  const terminalInput = document.querySelector<HTMLTextAreaElement>("#terminal-input");
-
-  terminalScreen?.addEventListener("pointerdown", handleTerminalPointerDown);
-  terminalScreen?.addEventListener("pointermove", handleTerminalPointerMove);
-  terminalScreen?.addEventListener("scroll", () => {
-    state.autoFollow = isTerminalNearBottom();
-    scheduleTerminalRender();
-  });
-  terminalScreen?.addEventListener("click", () => {
-    focusTerminalInput();
-  });
-
-  terminalInput?.addEventListener("keydown", handleTerminalKeyDown);
-  terminalInput?.addEventListener("input", handleTerminalInput);
-  terminalInput?.addEventListener("paste", handleTerminalPaste);
-
-  window.removeEventListener("pointerup", stopPointerSelection);
-  window.addEventListener("pointerup", stopPointerSelection);
 }
 
 function renderPortOptions(): string {
@@ -329,7 +396,10 @@ function renderPortOptions(): string {
     .join("");
 }
 
-function renderSegment(setting: keyof Pick<SerialConfig, "data_bits" | "parity" | "stop_bits">, options: SegmentOption[]): string {
+function renderSegment(
+  setting: keyof Pick<SerialConfig, "data_bits" | "parity" | "stop_bits">,
+  options: SegmentOption[],
+): string {
   const currentValue = String(state.config[setting]);
   const locked = state.mode === "connected" || state.mode === "connecting";
 
@@ -362,7 +432,16 @@ function applySerialSetting(setting: string, value: string): void {
     state.config.stop_bits = Number(value);
   }
 
+  saveSettings();
   renderApp();
+}
+
+function applyTerminalOptions(): void {
+  terminal.options.fontFamily = terminalFontFamily();
+  terminal.options.fontSize = state.fontSize;
+  terminal.options.lineHeight = state.lineSpacing;
+  queueFit();
+  terminal.focus();
 }
 
 async function refreshPorts(): Promise<void> {
@@ -371,6 +450,7 @@ async function refreshPorts(): Promise<void> {
     state.ports = ports;
     if (!state.config.port_name || !ports.includes(state.config.port_name)) {
       state.config.port_name = ports[0] ?? "";
+      saveSettings();
     }
     state.lastError = "";
   } catch (error) {
@@ -405,15 +485,14 @@ async function connectSerial(): Promise<void> {
     state.mode = "connected";
     state.rxBytes = 0;
     state.txBytes = 0;
-    appendSystemLine(`已连接 ${state.config.port_name} @ ${state.config.baud_rate}`);
+    terminal.writeln(`\x1b[32m已连接 ${state.config.port_name} @ ${state.config.baud_rate}\x1b[0m`);
   } catch (error) {
     state.mode = "error";
     state.lastError = toMessage(error);
-    appendSystemLine(state.lastError);
+    terminal.writeln(`\x1b[31m${state.lastError}\x1b[0m`);
   }
 
   renderApp();
-  focusTerminalInput();
 }
 
 async function disconnectSerial(): Promise<void> {
@@ -423,11 +502,8 @@ async function disconnectSerial(): Promise<void> {
     state.lastError = toMessage(error);
   }
 
-  if (state.mode !== "error") {
-    appendSystemLine("串口已关闭");
-  }
-
   state.mode = "disconnected";
+  terminal.writeln("\x1b[90m串口已关闭\x1b[0m");
   renderApp();
 }
 
@@ -442,435 +518,125 @@ async function sendText(text: string): Promise<void> {
   } catch (error) {
     state.lastError = toMessage(error);
     state.mode = "error";
-    appendSystemLine(state.lastError);
+    terminal.writeln(`\x1b[31m${state.lastError}\x1b[0m`);
     renderApp();
   }
 }
 
-function handleTerminalInput(event: Event): void {
-  const input = event.currentTarget as HTMLTextAreaElement;
-  const text = input.value;
-  input.value = "";
-  void sendText(text);
+function normalizeTerminalInput(data: string): string {
+  return data.replace(/\x1b\[3~/g, "\b").replace(/\x7f/g, "\b");
 }
 
-function handleTerminalPaste(event: ClipboardEvent): void {
-  const text = event.clipboardData?.getData("text") ?? "";
-  if (text.length === 0) {
-    return;
-  }
-
-  event.preventDefault();
-  void sendText(text);
-}
-
-function handleTerminalKeyDown(event: KeyboardEvent): void {
-  if (event.ctrlKey && event.key.toLowerCase() === "c") {
-    event.preventDefault();
-    void handleControlC();
-    return;
-  }
-
-  if (event.ctrlKey && event.key.toLowerCase() === "d") {
-    event.preventDefault();
-    void sendText("\u0004");
-    return;
-  }
-
-  if (event.ctrlKey && event.key.toLowerCase() === "z") {
-    event.preventDefault();
-    void sendText("\u001a");
-    return;
-  }
-
-  const specialKeys = new Map<string, string>([
-    ["Enter", "\r"],
-    ["Backspace", "\u0008"],
-    ["Delete", "\u007f"],
-    ["Tab", "\t"],
-    ["Escape", "\u001b"],
-    ["ArrowUp", "\u001b[A"],
-    ["ArrowDown", "\u001b[B"],
-    ["ArrowRight", "\u001b[C"],
-    ["ArrowLeft", "\u001b[D"],
-    ["Home", "\u001b[H"],
-    ["End", "\u001b[F"],
-    ["PageUp", "\u001b[5~"],
-    ["PageDown", "\u001b[6~"],
-  ]);
-  const sequence = specialKeys.get(event.key);
-
-  if (sequence) {
-    event.preventDefault();
-    void sendText(sequence);
-  }
-}
-
-async function handleControlC(): Promise<void> {
-  const selectedText = selectedLinesText();
-  if (selectedText.length > 0) {
-    await navigator.clipboard.writeText(selectedText);
-    clearSelection();
-    return;
-  }
-
-  await sendText("\u0003");
-}
-
-function handleTerminalPointerDown(event: PointerEvent): void {
-  const point = pointFromPointer(event);
-  if (event.button !== 0 || !point) {
-    return;
-  }
-
-  event.preventDefault();
-  pointerSelecting = true;
-  state.selectionAnchor = point;
-  state.selectionFocus = point;
-  renderTerminal();
-  focusTerminalInput();
-}
-
-function handleTerminalPointerMove(event: PointerEvent): void {
-  if (!pointerSelecting) {
-    return;
-  }
-
-  const point = pointFromPointer(event);
-  if (!point) {
-    return;
-  }
-
-  state.selectionFocus = point;
-  renderTerminal();
-}
-
-function stopPointerSelection(): void {
-  pointerSelecting = false;
-}
-
-function pointFromPointer(event: PointerEvent): SelectionPoint | null {
-  const target = event.target instanceof Element ? event.target.closest(".terminal-line") : null;
-  if (!(target instanceof HTMLElement)) {
-    return null;
-  }
-
-  const row = Number(target.dataset.lineIndex);
-  if (!Number.isFinite(row)) {
-    return null;
-  }
-
-  const rect = target.getBoundingClientRect();
-  const col = Math.max(0, Math.floor((event.clientX - rect.left) / cellWidth));
-  return { row, col };
-}
-
-function appendSystemLine(message: string): void {
-  const prefix = state.lines.length === 1 && state.lines[0] === "" ? "" : "\r\n";
-  appendTerminalText(`${prefix}${message}\r\n`);
-}
-
-function appendTerminalText(text: string): void {
-  for (const char of text) {
-    appendTerminalChar(char);
-  }
-
-  if (state.lines.length > maxTerminalLines) {
-    const extra = state.lines.length - maxTerminalLines;
-    state.lines.splice(0, extra);
-    shiftSelectionRows(extra);
-  }
-
-  scheduleTerminalRender();
-}
-
-function appendTerminalChar(char: string): void {
-  if (ansiEscapeState === "escape") {
-    ansiEscapeState = "[?]();#".includes(char) ? "sequence" : "none";
-    return;
-  }
-
-  if (ansiEscapeState === "sequence") {
-    const code = char.charCodeAt(0);
-    if (code >= 0x40 && code <= 0x7e && !"[?];0123456789 ".includes(char)) {
-      ansiEscapeState = "none";
+function copySelection(clearAfterCopy = false): void {
+  const selection = terminal.getSelection();
+  if (selection.length > 0) {
+    void navigator.clipboard.writeText(selection);
+    if (clearAfterCopy) {
+      terminal.clearSelection();
     }
-    return;
   }
-
-  if (char === "\u001b") {
-    ansiEscapeState = "escape";
-    return;
-  }
-
-  if (char === "\r") {
-    state.cursorCol = 0;
-    return;
-  }
-
-  if (char === "\n") {
-    state.lines.push("");
-    state.cursorCol = 0;
-    return;
-  }
-
-  if (char === "\b" || char === "\u007f") {
-    backspaceTerminalChar();
-    return;
-  }
-
-  if (char < " ") {
-    return;
-  }
-
-  const lineIndex = state.lines.length - 1;
-  const cells = Array.from(state.lines[lineIndex] ?? "");
-  while (cells.length < state.cursorCol) {
-    cells.push(" ");
-  }
-  cells.splice(state.cursorCol, 1, char);
-  state.lines[lineIndex] = cells.join("");
-  state.cursorCol += 1;
-}
-
-function backspaceTerminalChar(): void {
-  const lineIndex = state.lines.length - 1;
-  const cells = Array.from(state.lines[lineIndex] ?? "");
-
-  if (state.cursorCol > 0) {
-    cells.splice(state.cursorCol - 1, 1);
-    state.cursorCol -= 1;
-    state.lines[lineIndex] = cells.join("");
-  } else if (state.lines.length > 1) {
-    const previous = state.lines[state.lines.length - 2] ?? "";
-    const current = state.lines.pop() ?? "";
-    state.cursorCol = Array.from(previous).length;
-    state.lines[state.lines.length - 1] = previous + current;
-  }
-}
-
-function scheduleTerminalRender(): void {
-  if (terminalRenderQueued) {
-    return;
-  }
-
-  terminalRenderQueued = true;
-  requestAnimationFrame(() => {
-    terminalRenderQueued = false;
-    renderTerminal();
-    updateStats();
-  });
-}
-
-function renderTerminal(keepScroll = true): void {
-  const terminalLines = document.querySelector<HTMLDivElement>("#terminal-lines");
-  const terminalScreen = document.querySelector<HTMLDivElement>("#terminal-screen");
-  if (!terminalLines || !terminalScreen) {
-    return;
-  }
-
-  updateTerminalStyle();
-  measureCellWidth();
-
-  const distanceFromBottom =
-    terminalScreen.scrollHeight - terminalScreen.scrollTop - terminalScreen.clientHeight;
-  const shouldFollow = state.autoFollow || !keepScroll;
-  const lineHeight = currentLineHeight();
-  const topLine = Math.max(0, Math.floor(terminalScreen.scrollTop / lineHeight));
-  const visibleRows = Math.ceil(terminalScreen.clientHeight / lineHeight);
-  const overscan = 12;
-  const startIndex = Math.max(0, topLine - overscan);
-  const endIndex = Math.min(state.lines.length, topLine + visibleRows + overscan);
-  const topSpacerHeight = startIndex * lineHeight;
-  const bottomSpacerHeight = (state.lines.length - endIndex) * lineHeight;
-
-  terminalLines.innerHTML =
-    `<div class="terminal-spacer" style="height: ${topSpacerHeight}px"></div>` +
-    state.lines
-      .slice(startIndex, endIndex)
-      .map((line, offset) => renderTerminalLine(line, startIndex + offset))
-      .join("") +
-    `<div class="terminal-spacer" style="height: ${bottomSpacerHeight}px"></div>`;
-
-  if (shouldFollow) {
-    terminalScreen.scrollTop = terminalScreen.scrollHeight;
-  } else {
-    terminalScreen.scrollTop = Math.max(
-      0,
-      terminalScreen.scrollHeight - terminalScreen.clientHeight - distanceFromBottom,
-    );
-  }
-}
-
-function renderTerminalLine(line: string, index: number): string {
-  const selection = normalizedSelection();
-  const cells = Array.from(line);
-  const isSelectedWholeLine =
-    selection !== null &&
-    selection.start.row !== selection.end.row &&
-    index >= selection.start.row &&
-    index <= selection.end.row;
-
-  const className = `terminal-line${isSelectedWholeLine ? " whole-selected" : ""}`;
-  let content = escapeHtml(line.length === 0 ? " " : line);
-
-  if (selection && selection.start.row === selection.end.row && index === selection.start.row) {
-    const startCol = Math.min(selection.start.col, cells.length);
-    const endCol = Math.min(Math.max(selection.end.col, startCol + 1), cells.length);
-    content =
-      escapeHtml(cells.slice(0, startCol).join("")) +
-      `<span class="inline-selected">${escapeHtml(cells.slice(startCol, endCol).join(""))}</span>` +
-      escapeHtml(cells.slice(endCol).join(""));
-  } else if (!selection && index === state.lines.length - 1) {
-    const caretCol = Math.min(state.cursorCol, cells.length);
-    content =
-      escapeHtml(cells.slice(0, caretCol).join("")) +
-      `<span class="terminal-caret"></span>` +
-      escapeHtml(cells.slice(caretCol).join(""));
-  }
-
-  return `<div class="${className}" data-line-index="${index}">${content}</div>`;
-}
-
-function normalizedSelection(): { start: SelectionPoint; end: SelectionPoint } | null {
-  if (!state.selectionAnchor || !state.selectionFocus) {
-    return null;
-  }
-
-  const a = state.selectionAnchor;
-  const b = state.selectionFocus;
-  if (a.row < b.row || (a.row === b.row && a.col <= b.col)) {
-    return { start: a, end: b };
-  }
-
-  return { start: b, end: a };
-}
-
-function selectedLinesText(): string {
-  const selection = normalizedSelection();
-  if (!selection) {
-    return "";
-  }
-
-  if (selection.start.row !== selection.end.row) {
-    return state.lines.slice(selection.start.row, selection.end.row + 1).join("\n");
-  }
-
-  const line = Array.from(state.lines[selection.start.row] ?? "");
-  const startCol = Math.min(selection.start.col, line.length);
-  const endCol = Math.min(Math.max(selection.end.col, startCol + 1), line.length);
-  return line.slice(startCol, endCol).join("");
-}
-
-function shiftSelectionRows(count: number): void {
-  if (state.selectionAnchor) {
-    state.selectionAnchor.row = Math.max(0, state.selectionAnchor.row - count);
-  }
-  if (state.selectionFocus) {
-    state.selectionFocus.row = Math.max(0, state.selectionFocus.row - count);
-  }
-}
-
-function clearSelection(): void {
-  state.selectionAnchor = null;
-  state.selectionFocus = null;
-  renderTerminal();
-}
-
-function clearTerminal(): void {
-  state.lines = [""];
-  state.cursorCol = 0;
-  state.selectionAnchor = null;
-  state.selectionFocus = null;
-  state.autoFollow = true;
-  renderTerminal(false);
-}
-
-function updateTerminalStyle(): void {
-  const terminalScreen = document.querySelector<HTMLDivElement>("#terminal-screen");
-  if (!terminalScreen) {
-    return;
-  }
-
-  terminalScreen.style.fontFamily = `${state.fontFamily}, "Cascadia Mono", Consolas, monospace`;
-  terminalScreen.style.fontSize = `${state.fontSize}px`;
-  terminalScreen.style.lineHeight = String(state.lineSpacing);
-}
-
-function measureCellWidth(): void {
-  const terminalScreen = document.querySelector<HTMLDivElement>("#terminal-screen");
-  if (!terminalScreen) {
-    return;
-  }
-
-  const style = window.getComputedStyle(terminalScreen);
-  const canvas = document.createElement("canvas");
-  const context = canvas.getContext("2d");
-  if (!context) {
-    return;
-  }
-
-  context.font = `${style.fontSize} ${style.fontFamily}`;
-  cellWidth = Math.max(4, context.measureText("M").width);
-}
-
-function getTopLine(): number {
-  const terminalScreen = document.querySelector<HTMLDivElement>("#terminal-screen");
-  if (!terminalScreen) {
-    return 0;
-  }
-
-  const lineHeight = currentLineHeight();
-  return Math.max(0, Math.floor(terminalScreen.scrollTop / lineHeight));
-}
-
-function scrollToLine(line: number): void {
-  const terminalScreen = document.querySelector<HTMLDivElement>("#terminal-screen");
-  if (!terminalScreen) {
-    return;
-  }
-
-  terminalScreen.scrollTop = line * currentLineHeight();
-}
-
-function currentLineHeight(): number {
-  const terminalLine = document.querySelector<HTMLElement>(".terminal-line");
-  if (terminalLine) {
-    return Math.max(1, terminalLine.getBoundingClientRect().height);
-  }
-
-  return Math.max(1, state.fontSize * state.lineSpacing);
-}
-
-function isTerminalNearBottom(): boolean {
-  const terminalScreen = document.querySelector<HTMLDivElement>("#terminal-screen");
-  if (!terminalScreen) {
-    return true;
-  }
-
-  return (
-    terminalScreen.scrollHeight - terminalScreen.scrollTop - terminalScreen.clientHeight < 4
-  );
-}
-
-function focusTerminalInput(): void {
-  document.querySelector<HTMLTextAreaElement>("#terminal-input")?.focus();
-}
-
-function updateStats(): void {
-  const rx = document.querySelector("#rx-stat");
-  const tx = document.querySelector("#tx-stat");
-  if (rx) {
-    rx.textContent = `RX ${formatBytes(state.rxBytes)}`;
-  }
-  if (tx) {
-    tx.textContent = `TX ${formatBytes(state.txBytes)}`;
-  }
+  terminal.focus();
 }
 
 function updateScale(): void {
-  const scale = Math.min(1.18, Math.max(0.55, Math.min(window.innerWidth / 1440, window.innerHeight / 850)));
+  const scale = Math.min(
+    1.18,
+    Math.max(0.55, Math.min(window.innerWidth / 1440, window.innerHeight / 850)),
+  );
   document.documentElement.style.setProperty("--ui-scale", scale.toFixed(3));
+}
+
+function queueFit(): void {
+  if (fitQueued) {
+    return;
+  }
+
+  fitQueued = true;
+  requestAnimationFrame(() => {
+    fitQueued = false;
+    try {
+      fitAddon.fit();
+    } catch {
+      // The fit addon can run before xterm has completed its first layout pass.
+    }
+  });
+}
+
+function updateStats(): void {
+  updateText("#rx-stat", `RX ${formatBytes(state.rxBytes)}`);
+  updateText("#tx-stat", `TX ${formatBytes(state.txBytes)}`);
+}
+
+function updateOutput(selector: string, text: string): void {
+  const output = document.querySelector<HTMLOutputElement>(selector);
+  if (output) {
+    output.value = text;
+    output.textContent = text;
+  }
+}
+
+function updateText(selector: string, text: string): void {
+  const element = document.querySelector(selector);
+  if (element) {
+    element.textContent = text;
+  }
+}
+
+function terminalFontFamily(): string {
+  return `${state.fontFamily}, "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace`;
+}
+
+function readSavedSettings(): SavedSettings {
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) {
+      return {};
+    }
+    const value = JSON.parse(raw) as SavedSettings;
+    return normalizeSavedSettings(value);
+  } catch {
+    return {};
+  }
+}
+
+function normalizeSavedSettings(value: SavedSettings): SavedSettings {
+  const config = value.config ?? {};
+  const parity = config.parity === "even" || config.parity === "odd" ? config.parity : "none";
+
+  return {
+    config: {
+      port_name: typeof config.port_name === "string" ? config.port_name : "",
+      baud_rate:
+        typeof config.baud_rate === "number" && Number.isFinite(config.baud_rate)
+          ? config.baud_rate
+          : 1500000,
+      data_bits: [5, 6, 7, 8].includes(config.data_bits ?? 0) ? config.data_bits : 8,
+      parity,
+      stop_bits: config.stop_bits === 2 ? 2 : 1,
+    },
+    fontFamily:
+      typeof value.fontFamily === "string" && value.fontFamily.length > 0
+        ? value.fontFamily
+        : fontFamilies[0],
+    fontSize:
+      typeof value.fontSize === "number" && Number.isFinite(value.fontSize)
+        ? Math.min(34, Math.max(12, value.fontSize))
+        : 18,
+    lineSpacing:
+      typeof value.lineSpacing === "number" && Number.isFinite(value.lineSpacing)
+        ? Math.min(1.6, Math.max(0.9, value.lineSpacing))
+        : 1,
+  };
+}
+
+function saveSettings(): void {
+  const value: SavedSettings = {
+    config: state.config,
+    fontFamily: state.fontFamily,
+    fontSize: state.fontSize,
+    lineSpacing: state.lineSpacing,
+  };
+  localStorage.setItem(storageKey, JSON.stringify(value));
 }
 
 function statusTone(): string {
@@ -948,25 +714,23 @@ function toMessage(error: unknown): string {
 async function setupBackendListeners(): Promise<void> {
   await listen<SerialDataPayload>("serial-data", (event) => {
     state.rxBytes += event.payload.byte_count;
-    const text = decoder.decode(new Uint8Array(event.payload.data), { stream: true });
-    appendTerminalText(text);
+    const text = serialDecoder.decode(new Uint8Array(event.payload.data), { stream: true });
+    terminal.write(text);
+    updateStats();
   });
 
   await listen<SerialErrorPayload>("serial-error", (event) => {
     state.mode = "error";
     state.lastError = event.payload.message;
-    appendSystemLine(event.payload.message);
+    terminal.writeln(`\x1b[31m${event.payload.message}\x1b[0m`);
     void invoke<void>("disconnect");
     renderApp();
   });
 }
 
 window.addEventListener("resize", () => {
-  const topLine = getTopLine();
   updateScale();
-  requestAnimationFrame(() => {
-    scrollToLine(topLine);
-  });
+  queueFit();
 });
 
 updateScale();

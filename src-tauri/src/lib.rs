@@ -61,6 +61,14 @@ fn connect(
     let parity = map_parity(&config.parity)?;
     let stop_bits = map_stop_bits(config.stop_bits)?;
 
+    {
+        let mut state = manager
+            .inner
+            .lock()
+            .map_err(|_| "串口状态锁已损坏".to_string())?;
+        close_locked(&mut state);
+    }
+
     let port = serialport::new(&config.port_name, config.baud_rate)
         .data_bits(data_bits)
         .parity(parity)
@@ -77,8 +85,6 @@ fn connect(
         .inner
         .lock()
         .map_err(|_| "串口状态锁已损坏".to_string())?;
-    close_locked(&mut state);
-
     let reader_stop = Arc::new(AtomicBool::new(false));
     let reader_handle = spawn_reader(app, reader_port, Arc::clone(&reader_stop));
 
