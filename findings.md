@@ -15,6 +15,7 @@
 - 按住回车时仍能看到输出成段刷新；期望是一行一行连续刷出。
 - 回车刷新行已解决，但删除和快速输入仍表现为一块一块更新；期望按键级连续反馈。
 - 用户要求利用 git 分支把终端核心切回普通 xterm.js 做验证。
+- 用户反馈窗口拉伸时终端区域与窗口边框之间会出现黑色区域，拉伸变大后黑色区域周期性变大/消失。
 
 ## 研究发现
 - 当前 Tauri 版前端终端是自研文本渲染，天然缺少完整 ANSI、IME、宽字符、滚动缓冲、选择和 resize 语义。
@@ -54,6 +55,9 @@
 - xterm.js v6 与 `@xterm/addon-fit` 可直接编译通过，生产构建 JS 从 Ghostty 分支约 673KB 降到约 368KB。
 - xterm.js 的 `attachCustomKeyEventHandler` 返回 `false` 表示阻止 xterm 继续处理事件；这与此前 Ghostty 分支记录的语义相反，因此 Ctrl+C 有选区复制时必须返回 `false`。
 - xterm.js 原生支持 `lineHeight` 选项，不需要 Ghostty 分支中直接改 renderer metrics 的兼容逻辑。
+- xterm 默认 CSS 中 `.xterm .xterm-viewport` 使用 `background-color: #000`，composition view 和 scrollbar shadow 也有黑色默认值。
+- xterm 的 screen/canvas 实际尺寸按字符宽高的整数列/行变化；窗口连续拉伸时，host 尺寸会先变化，而 terminal screen 会在下一次 fit 到新列/行时跳变，因此边缘剩余区域会周期性出现/消失。
+- 如果 xterm 内部 viewport/screen/scrollbar track 的背景与外层终端背景不一致，resize 时这些剩余区域会表现为黑色闪动或黑边。
 
 ## 技术决策
 | 决策 | 理由 |
@@ -83,6 +87,7 @@
 | TX 到达即尝试发送 | 串口写入已后台化，前端输入应优先保证交互连续性，积压只在 invoke 并发耗尽时发生 |
 | writer 不再 drain 合并小包 | 快速输入/删除需要按键级到达设备，后台线程不应再把多个按键主动合成一次 `write_all` |
 | xterm 分支不引入 WebGL addon | 用户要求普通 xterm.js，本分支只使用 `@xterm/xterm` 和 `@xterm/addon-fit` |
+| 覆盖 xterm 内部背景 | resize 时字符网格不能连续填满所有像素，必须让所有可能露出的内部层使用同一终端背景色 |
 
 ## 遇到的问题
 | 问题 | 解决方案 |
@@ -102,6 +107,7 @@
 | 按住回车输出成段刷新 | 直接 COM5 读写测试显示硬件逐行返回；移除前端 RX rAF 合并，并降低 Rust reader timeout/buffer |
 | 删除和快速输入仍成块 | 移除前端 Backspace/普通输入 debounce；提高 invoke 并发上限；后端 writer 改为每个入队包单独 `write_all` |
 | 切回 xterm.js 需要重新处理键盘语义 | 将 Ctrl+C 选区复制处理改为返回 `false` 阻止 xterm 发送中断 |
+| xterm resize 黑边 | 将 root、viewport、screen、scroll area、scrollable element、scrollbar track 统一设为 `--terminal`，并给 screen 设置最小 100% 宽高 |
 
 ## 资源
 - 本地 `serial_terminal` Tauri 项目。

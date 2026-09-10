@@ -247,6 +247,22 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 16：修复窗口拉伸时终端黑边
+- **状态：** complete
+- 执行的操作：
+  - 读取用户反馈，确认现象是窗口连续拉伸时终端边缘黑色区域周期性增大/消失。
+  - 检查 xterm 默认 CSS，确认 `.xterm .xterm-viewport` 默认 `background-color: #000`。
+  - 复查当前终端容器样式，确认外层为 `--terminal`，但 xterm 内部 viewport/screen/scrollbar 仍可能露出默认黑色。
+  - 将 `.xterm`、`.xterm-viewport`、`.xterm-screen`、`.xterm-scroll-area`、`.xterm-scrollable-element` 背景统一覆盖为 `--terminal`。
+  - 给 `.xterm-screen` 设置 `min-width/min-height: 100%`，让字符网格未覆盖的剩余区域也用终端背景填充。
+  - 将 xterm viewport 滚动条轨道和 thumb border 改为终端背景色，去掉 resize 时的黑色轨道边缘。
+  - 运行前端构建和 `git diff --check`。
+- 创建/修改的文件：
+  - `src/styles.css`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -306,6 +322,8 @@
 | `cargo check` | xterm.js 分支回切后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run tauri -- info` | xterm.js 分支回切后 | Tauri 环境检测通过 | 通过 | 通过 |
 | `npm run tauri dev` | xterm.js 分支回切后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止 | 通过 |
+| `npm run build` | xterm resize 黑边修复后 | TypeScript/Vite 构建通过 | 构建通过 | 通过 |
+| `git diff --check` | xterm resize 黑边修复后 | 无空白错误 | 通过，仅有 CRLF 提示 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -324,12 +342,13 @@
 | 2026-09-10 | 按住回车时输出成段刷新 | 1 | 直接 COM5 测试证明硬件逐行返回，改为低延迟 reader 和前端即时写终端 |
 | 2026-09-10 | 删除和快速输入仍成块 | 1 | 移除前端输入 debounce 和后端 writer drain，改为按键级低延迟发送 |
 | 2026-09-10 | 需要切回普通 xterm.js 验证 | 1 | 创建 `codex/xterm-js` 分支并回切 xterm.js，保留低延迟串口链路 |
+| 2026-09-10 | 窗口拉伸时终端边缘出现周期性黑色区域 | 1 | 覆盖 xterm 内部默认黑色背景并让 screen 最小铺满 host |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 15：分支回切普通 xterm.js |
-| 我要去哪里？ | 提交 xterm.js 分支，等待用户实机 A/B 测试 |
+| 我在哪里？ | 完成阶段 16：修复窗口拉伸时终端黑边 |
+| 我要去哪里？ | 提交本轮 resize 视觉修复，并等待用户实机复测 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
 | 我做了什么？ | 建立子项目规划并确定替换终端核心 |

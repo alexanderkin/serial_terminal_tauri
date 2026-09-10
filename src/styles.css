@@ -700,16 +700,26 @@ output {
 .terminal-host .xterm {
   width: 100%;
   height: 100%;
-  background: var(--terminal);
+  --vscode-scrollbar-shadow: transparent;
+  background: var(--terminal) !important;
+  background-color: var(--terminal) !important;
 }
 
 .terminal-host .xterm-viewport,
+.terminal-host .xterm-screen,
+.terminal-host .xterm-scroll-area,
+.terminal-host .xterm-scrollable-element {
+  background: var(--terminal) !important;
+  background-color: var(--terminal) !important;
+}
+
 .terminal-host .xterm-screen {
-  background: var(--terminal);
+  min-width: 100%;
+  min-height: 100%;
 }
 
 .terminal-host .xterm-viewport {
-  scrollbar-color: #6b6b6b #151515;
+  scrollbar-color: #6b6b6b var(--terminal);
   scrollbar-width: thin;
 }
 
@@ -718,11 +728,11 @@ output {
 }
 
 .terminal-host .xterm-viewport::-webkit-scrollbar-track {
-  background: #151515;
+  background: var(--terminal);
 }
 
 .terminal-host .xterm-viewport::-webkit-scrollbar-thumb {
-  border: 2px solid #151515;
+  border: 2px solid var(--terminal);
   border-radius: 999px;
   background: #6b6b6b;
 }

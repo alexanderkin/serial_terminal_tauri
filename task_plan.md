@@ -6,7 +6,7 @@
 
 ## 下一步
 
-xterm.js 分支已完成回切，等待用户在 `codex/xterm-js` 分支实机 A/B 测试。
+窗口拉伸时终端边缘黑色闪现问题已修复，等待用户实机复测 resize 视觉效果。
 
 ## 当前阶段
 
@@ -136,6 +136,15 @@ xterm.js 分支已完成回切，等待用户在 `codex/xterm-js` 分支实机 A
 - [x] 构建、Rust 检查、Tauri info 和 Tauri dev 启动验证
 - **状态：** complete
 
+### 阶段 16：修复窗口拉伸时终端黑边
+- [x] 确认 xterm viewport 默认 CSS 背景为黑色
+- [x] 确认 xterm screen/canvas 按字符网格离散变化，窗口连续 resize 时会短暂露出内部背景
+- [x] 将 xterm root、viewport、screen、scroll area、scrollable element 背景统一为终端背景色
+- [x] 将 xterm screen 最小宽高设为 100%，覆盖字符网格剩余边缘区域
+- [x] 将滚动条轨道和 thumb border 改为终端背景色
+- [x] 前端构建和 diff 检查验证
+- **状态：** complete
+
 ## 关键问题
 
 1. 终端核心必须使用成熟库处理 ANSI、IME、宽字符、滚动缓冲和选择，不能继续手写简化版。
@@ -165,6 +174,7 @@ xterm.js 分支已完成回切，等待用户在 `codex/xterm-js` 分支实机 A
 | 串口 RX 走低延迟路径 | 直接 COM5 测试证明硬件可一行一行返回，应用不应再用 50ms 大读缓冲和前端 rAF 合并把多行攒成一段 |
 | 串口 TX 走低延迟路径 | 删除和快速输入是交互输入，不能再用 40ms debounce 或 writer drain 把按键合并成块 |
 | 用分支验证 xterm.js | 主线保留稳定状态，单独在 `codex/xterm-js` 分支 A/B 测试普通 xterm.js |
+| xterm 内部背景统一到终端背景 | xterm 的字符网格按离散列/行 resize，连续拉伸时会露出内部层背景；内部层不能保留默认黑色 |
 
 ## 遇到的错误
 
@@ -182,6 +192,7 @@ xterm.js 分支已完成回切，等待用户在 `codex/xterm-js` 分支实机 A
 | 按住回车时输出成段刷新 | 1 | 直接 COM5 测试确认硬件逐行返回；改为低延迟 reader 和前端即时写终端 |
 | 删除和快速输入仍成块 | 1 | 移除前端输入 debounce 和后端 writer 小包合并，改为按键级低延迟发送 |
 | 需要验证是否可切回普通 xterm.js | 1 | 在 `codex/xterm-js` 分支回切 xterm.js，保留低延迟串口链路用于实机测试 |
+| 窗口拉伸时终端边缘出现黑色区域 | 1 | 覆盖 xterm viewport/screen/scrollable 背景和滚动条轨道，使离散网格空隙显示为终端背景色 |
 
 ## 提交
 
