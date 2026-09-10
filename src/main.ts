@@ -46,7 +46,6 @@ interface AppState {
   pickerPosition: DropdownPosition | null;
   fontSize: number;
   lineSpacing: number;
-  localEcho: boolean;
 }
 
 interface SavedSettings {
@@ -54,7 +53,6 @@ interface SavedSettings {
   fontFamily?: string;
   fontSize?: number;
   lineSpacing?: number;
-  localEcho?: boolean;
 }
 
 interface SegmentOption {
@@ -65,16 +63,6 @@ interface SegmentOption {
 interface PickerOption {
   label: string;
   value: string;
-}
-
-interface LocalInputCell {
-  width: number;
-}
-
-interface PendingEchoToken {
-  alternatives: string[];
-  createdAt: number;
-  mergeable: boolean;
 }
 
 const baudRates = [
@@ -114,7 +102,6 @@ const state: AppState = {
   pickerPosition: null,
   fontSize: savedSettings.fontSize ?? 18,
   lineSpacing: savedSettings.lineSpacing ?? 1,
-  localEcho: savedSettings.localEcho ?? true,
 };
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -180,10 +167,6 @@ let fitQueued = false;
 let pendingSerialText = "";
 let serialFlushTimer: number | null = null;
 let serialWriteInFlight = false;
-let localInputCells: LocalInputCell[] = [];
-let pendingEchoTokens: PendingEchoToken[] = [];
-
-const pendingEchoTtlMs = 350;
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
@@ -271,10 +254,6 @@ function renderApp(): void {
               <span>字体</span>
               ${renderPicker("font", pickerLabel("font"), false)}
             </label>
-            <div class="field">
-              <span>输入预览</span>
-              ${renderLocalEchoSegment()}
-            </div>
             <label class="field range-field">
               <span>字号</span>
               <div class="range-row">
@@ -328,7 +307,7 @@ function attachTerminal(): void {
 
   terminalInputDisposable?.dispose();
   terminalInputDisposable = terminal.onData((data) => {
-    handleTerminalInput(data);
+    queueSerialText(normalizeTerminalInput(data));
   });
 
   host.addEventListener("contextmenu", (event) => {
@@ -384,16 +363,6 @@ function bindChromeEvents(): void {
     saveSettings();
     applyTerminalOptions();
   });
-
-  document.querySelectorAll<HTMLButtonElement>("[data-local-echo]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.localEcho = button.dataset.localEcho === "true";
-      resetLocalInputState();
-      saveSettings();
-      renderApp();
-      terminal.focus();
-    });
-  });
 }
 
 function renderSegment(
@@ -415,15 +384,6 @@ function renderSegment(
             }>${escapeHtml(option.label)}</button>`,
         )
         .join("")}
-    </div>
-  `;
-}
-
-function renderLocalEchoSegment(): string {
-  return `
-    <div class="segmented">
-      <button type="button" data-local-echo="true" class="${state.localEcho ? "active" : ""}">开</button>
-      <button type="button" data-local-echo="false" class="${state.localEcho ? "" : "active"}">关</button>
     </div>
   `;
 }
@@ -673,7 +633,6 @@ async function connectSerial(): Promise<void> {
   state.mode = "connecting";
   state.lastError = "";
   clearPendingSerialText();
-  resetLocalInputState();
   renderApp();
 
   try {
@@ -693,7 +652,6 @@ async function connectSerial(): Promise<void> {
 
 async function disconnectSerial(): Promise<void> {
   clearPendingSerialText();
-  resetLocalInputState();
   try {
     await invoke<void>("disconnect");
   } catch (error) {
@@ -705,26 +663,17 @@ async function disconnectSerial(): Promise<void> {
   renderApp();
 }
 
-function handleTerminalInput(data: string): void {
-  const text = normalizeTerminalInput(data);
-  if (state.mode === "connected" && state.localEcho) {
-    applyLocalInputPreview(text);
-  }
-
-  queueSerialText(text);
-}
-
 function queueSerialText(text: string): void {
   if (state.mode !== "connected" || text.length === 0) {
     return;
   }
 
   pendingSerialText += text;
-  scheduleSerialFlush(shouldFlushImmediately(text) ? 0 : 3);
+  scheduleSerialFlush(shouldFlushImmediately(text) ? 0 : 6);
 }
 
 function shouldFlushImmediately(text: string): boolean {
-  return /[\r\x08\u0003\u0004\u001a]/.test(text);
+  return /[\r\u0003\u0004\u001a]/.test(text);
 }
 
 function scheduleSerialFlush(delayMs: number): void {
@@ -771,216 +720,8 @@ function clearPendingSerialText(): void {
   }
 }
 
-function applyLocalInputPreview(text: string): void {
-  let index = 0;
-  while (index < text.length) {
-    const char = text[index];
-
-    if (char === "\x1b") {
-      index += escapeSequenceLength(text, index);
-      continue;
-    }
-
-    if (char === "\r" || char === "\n") {
-      localInputCells = [];
-      terminal.write("\r\n");
-      pushPendingEcho(["\r\n", "\r", "\n"]);
-      index += char === "\r" && text[index + 1] === "\n" ? 2 : 1;
-      continue;
-    }
-
-    if (char === "\b") {
-      previewBackspace();
-      index += 1;
-      continue;
-    }
-
-    if (isControlCharacter(char)) {
-      if (char === "\u0003") {
-        localInputCells = [];
-      }
-      index += 1;
-      continue;
-    }
-
-    const next = nextCodePoint(text, index);
-    terminal.write(next.text);
-    localInputCells.push({
-      width: cellWidth(next.text),
-    });
-    pushPendingEcho([next.text], true);
-    index = next.nextIndex;
-  }
-}
-
-function previewBackspace(): void {
-  const cell = localInputCells.pop();
-  if (!cell) {
-    return;
-  }
-
-  const eraseSequence = eraseCells(cell.width);
-  terminal.write(eraseSequence);
-  pushPendingEcho([eraseSequence, "\b \b", "\b", "\x7f"]);
-}
-
-function suppressLocalEcho(text: string): string {
-  if (pendingEchoTokens.length === 0 || text.length === 0) {
-    return text;
-  }
-
-  prunePendingEchoTokens();
-  let remaining = text;
-
-  while (remaining.length > 0 && pendingEchoTokens.length > 0) {
-    const token = pendingEchoTokens[0];
-    const partials = token.alternatives.filter(
-      (alternative) => alternative.startsWith(remaining) && alternative.length > remaining.length,
-    );
-    const hasLongerRemainingMatch = token.alternatives.some(
-      (alternative) => remaining.startsWith(alternative) && remaining.length > alternative.length,
-    );
-    if (partials.length > 0 && !hasLongerRemainingMatch) {
-      token.alternatives = partials.map((alternative) => alternative.slice(remaining.length));
-      return "";
-    }
-
-    const match = longestPrefixMatch(remaining, token.alternatives);
-    if (match) {
-      remaining = remaining.slice(match.length);
-      pendingEchoTokens.shift();
-      continue;
-    }
-
-    pendingEchoTokens = [];
-    break;
-  }
-
-  return remaining;
-}
-
-function pushPendingEcho(alternatives: string[], mergeable = false): void {
-  const values = alternatives.filter((value) => value.length > 0);
-  if (values.length === 0) {
-    return;
-  }
-
-  const previous = pendingEchoTokens[pendingEchoTokens.length - 1];
-  if (mergeable && values.length === 1 && previous?.mergeable) {
-    previous.alternatives = [previous.alternatives[0] + values[0]];
-    previous.createdAt = performance.now();
-    return;
-  }
-
-  pendingEchoTokens.push({
-    alternatives: values.sort((left, right) => right.length - left.length),
-    createdAt: performance.now(),
-    mergeable,
-  });
-
-  if (pendingEchoTokens.length > 512) {
-    pendingEchoTokens.splice(0, pendingEchoTokens.length - 512);
-  }
-}
-
-function prunePendingEchoTokens(): void {
-  const now = performance.now();
-  pendingEchoTokens = pendingEchoTokens.filter((token) => now - token.createdAt <= pendingEchoTtlMs);
-}
-
-function resetLocalInputState(): void {
-  localInputCells = [];
-  pendingEchoTokens = [];
-}
-
 function normalizeTerminalInput(data: string): string {
   return data.replace(/\x1b\[3~/g, "\b").replace(/\x7f/g, "\b");
-}
-
-function nextCodePoint(value: string, index: number): { text: string; nextIndex: number } {
-  const codePoint = value.codePointAt(index) ?? 0;
-  const text = String.fromCodePoint(codePoint);
-  return {
-    text,
-    nextIndex: index + text.length,
-  };
-}
-
-function escapeSequenceLength(value: string, index: number): number {
-  if (value[index] !== "\x1b") {
-    return 1;
-  }
-
-  if (value[index + 1] !== "[") {
-    return 1;
-  }
-
-  let cursor = index + 2;
-  while (cursor < value.length) {
-    const code = value.charCodeAt(cursor);
-    cursor += 1;
-    if (code >= 0x40 && code <= 0x7e) {
-      break;
-    }
-  }
-
-  return cursor - index;
-}
-
-function isControlCharacter(value: string): boolean {
-  const code = value.charCodeAt(0);
-  return code < 0x20 || code === 0x7f;
-}
-
-function cellWidth(value: string): number {
-  let width = 0;
-  for (let index = 0; index < value.length; ) {
-    const codePoint = value.codePointAt(index) ?? 0;
-    const char = String.fromCodePoint(codePoint);
-    index += char.length;
-
-    if (isZeroWidthCodePoint(codePoint)) {
-      continue;
-    }
-
-    width += isWideCodePoint(codePoint) ? 2 : 1;
-  }
-
-  return Math.max(1, width);
-}
-
-function isZeroWidthCodePoint(codePoint: number): boolean {
-  return (
-    (codePoint >= 0x0300 && codePoint <= 0x036f) ||
-    (codePoint >= 0x1ab0 && codePoint <= 0x1aff) ||
-    (codePoint >= 0x1dc0 && codePoint <= 0x1dff) ||
-    (codePoint >= 0x20d0 && codePoint <= 0x20ff) ||
-    (codePoint >= 0xfe20 && codePoint <= 0xfe2f)
-  );
-}
-
-function isWideCodePoint(codePoint: number): boolean {
-  return (
-    (codePoint >= 0x1100 && codePoint <= 0x115f) ||
-    codePoint === 0x2329 ||
-    codePoint === 0x232a ||
-    (codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
-    (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
-    (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
-    (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
-    (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
-    (codePoint >= 0xff00 && codePoint <= 0xff60) ||
-    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
-    (codePoint >= 0x1f300 && codePoint <= 0x1faff)
-  );
-}
-
-function eraseCells(width: number): string {
-  return "\b \b".repeat(Math.max(1, width));
-}
-
-function longestPrefixMatch(value: string, alternatives: string[]): string {
-  return alternatives.find((alternative) => value.startsWith(alternative)) ?? "";
 }
 
 function copySelection(clearAfterCopy = false): void {
@@ -1122,7 +863,6 @@ function normalizeSavedSettings(value: SavedSettings): SavedSettings {
       typeof value.lineSpacing === "number" && Number.isFinite(value.lineSpacing)
         ? Math.min(1.6, Math.max(0.9, value.lineSpacing))
         : 1,
-    localEcho: typeof value.localEcho === "boolean" ? value.localEcho : true,
   };
 }
 
@@ -1132,7 +872,6 @@ function saveSettings(): void {
     fontFamily: state.fontFamily,
     fontSize: state.fontSize,
     lineSpacing: state.lineSpacing,
-    localEcho: state.localEcho,
   };
   localStorage.setItem(storageKey, JSON.stringify(value));
 }
@@ -1209,10 +948,7 @@ async function setupBackendListeners(): Promise<void> {
   await listen<SerialDataPayload>("serial-data", (event) => {
     state.rxBytes += event.payload.byte_count;
     const text = serialDecoder.decode(new Uint8Array(event.payload.data), { stream: true });
-    const visibleText = state.localEcho ? suppressLocalEcho(text) : text;
-    if (visibleText.length > 0) {
-      terminal.write(visibleText);
-    }
+    terminal.write(text);
     updateStats();
   });
 
@@ -1220,7 +956,6 @@ async function setupBackendListeners(): Promise<void> {
     state.mode = "error";
     state.lastError = event.payload.message;
     clearPendingSerialText();
-    resetLocalInputState();
     terminal.writeln(`\x1b[31m${event.payload.message}\x1b[0m`);
     void invoke<void>("disconnect");
     renderApp();
