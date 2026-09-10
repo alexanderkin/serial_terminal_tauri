@@ -126,8 +126,6 @@ fn write_text(manager: State<'_, SerialManager>, text: String) -> Result<u64, St
 
     port.write_all(bytes)
         .map_err(|error| format!("写入串口失败: {error}"))?;
-    port.flush()
-        .map_err(|error| format!("刷新串口输出失败: {error}"))?;
     state.tx_bytes += bytes.len() as u64;
 
     Ok(state.tx_bytes)

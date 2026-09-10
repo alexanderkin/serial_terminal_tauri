@@ -261,8 +261,8 @@ select {
 select:focus,
 input:focus,
 button:focus-visible,
-.font-search:focus,
-.font-picker-button:focus-visible {
+.picker-search:focus,
+.picker-button:focus-visible {
   border-color: var(--accent);
 }
 
@@ -347,12 +347,12 @@ button:focus-visible,
   align-items: center;
 }
 
-.font-combobox {
+.picker-anchor {
   position: relative;
   min-width: 0;
 }
 
-.font-picker-button {
+.picker-button {
   width: 100%;
   min-width: 0;
   height: clamp(30px, calc(40px * var(--ui-scale)), 40px);
@@ -370,24 +370,21 @@ button:focus-visible,
   text-align: left;
 }
 
-.font-picker-button span:first-child {
+.picker-button span:first-child {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.font-picker-chevron {
+.picker-chevron {
   color: var(--muted);
   font-size: clamp(8px, calc(10px * var(--ui-scale)), 10px);
 }
 
-.font-menu {
-  position: absolute;
+.picker-menu {
+  position: fixed;
   z-index: 40;
-  top: calc(100% + 6px);
-  left: 0;
-  right: 0;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -395,7 +392,7 @@ button:focus-visible,
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
 }
 
-.font-search {
+.picker-search {
   width: 100%;
   height: clamp(30px, calc(38px * var(--ui-scale)), 38px);
   border: 0;
@@ -407,37 +404,36 @@ button:focus-visible,
   font-size: clamp(10px, calc(13px * var(--ui-scale)), 13px);
 }
 
-.font-search::placeholder {
+.picker-search::placeholder {
   color: #777777;
 }
 
-.font-options {
-  max-height: clamp(140px, calc(230px * var(--ui-scale)), 260px);
+.picker-options {
   overflow-y: auto;
   padding: calc(4px * var(--ui-scale));
   scrollbar-color: var(--accent) #161616;
   scrollbar-width: thin;
 }
 
-.font-options::-webkit-scrollbar {
+.picker-options::-webkit-scrollbar {
   width: calc(10px * var(--ui-scale));
 }
 
-.font-options::-webkit-scrollbar-track {
+.picker-options::-webkit-scrollbar-track {
   background: #161616;
 }
 
-.font-options::-webkit-scrollbar-thumb {
+.picker-options::-webkit-scrollbar-thumb {
   border: 2px solid #161616;
   border-radius: 999px;
   background: var(--accent);
 }
 
-.font-options::-webkit-scrollbar-thumb:hover {
+.picker-options::-webkit-scrollbar-thumb:hover {
   background: var(--accent-strong);
 }
 
-.font-option {
+.picker-option {
   width: 100%;
   min-width: 0;
   height: clamp(28px, calc(34px * var(--ui-scale)), 34px);
@@ -452,20 +448,20 @@ button:focus-visible,
   text-align: left;
 }
 
-.font-option span {
+.picker-option span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.font-option:hover,
-.font-option.active {
+.picker-option:hover,
+.picker-option.active {
   background: rgba(0, 120, 212, 0.28);
   color: #ffffff;
 }
 
-.font-empty {
+.picker-empty {
   padding: calc(14px * var(--ui-scale)) calc(10px * var(--ui-scale));
   color: var(--muted);
   font-size: clamp(10px, calc(12px * var(--ui-scale)), 12px);

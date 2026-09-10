@@ -6,6 +6,15 @@ import "@xterm/xterm/css/xterm.css";
 
 type ConnectionMode = "disconnected" | "connecting" | "connected" | "error";
 type Parity = "none" | "even" | "odd";
+type PickerId = "port" | "baud" | "font";
+
+interface DropdownPosition {
+  left: number;
+  top: number;
+  width: number;
+  maxHeight: number;
+  placement: "up" | "down";
+}
 
 interface SerialConfig {
   port_name: string;
@@ -33,8 +42,9 @@ interface AppState {
   txBytes: number;
   lastError: string;
   fontFamily: string;
-  fontQuery: string;
-  fontDropdownOpen: boolean;
+  activePicker: PickerId | null;
+  pickerQuery: string;
+  pickerPosition: DropdownPosition | null;
   fontSize: number;
   lineSpacing: number;
 }
@@ -47,6 +57,11 @@ interface SavedSettings {
 }
 
 interface SegmentOption {
+  label: string;
+  value: string;
+}
+
+interface PickerOption {
   label: string;
   value: string;
 }
@@ -84,8 +99,9 @@ const state: AppState = {
   txBytes: 0,
   lastError: "",
   fontFamily: savedSettings.fontFamily ?? fallbackFontFamilies[0],
-  fontQuery: "",
-  fontDropdownOpen: false,
+  activePicker: null,
+  pickerQuery: "",
+  pickerPosition: null,
   fontSize: savedSettings.fontSize ?? 18,
   lineSpacing: savedSettings.lineSpacing ?? 1,
 };
@@ -150,6 +166,9 @@ let terminalHost: HTMLDivElement | null = null;
 let terminalInputDisposable: { dispose(): void } | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let fitQueued = false;
+let pendingSerialText = "";
+let serialFlushTimer: number | null = null;
+let serialWriteInFlight = false;
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
@@ -181,25 +200,13 @@ function renderApp(): void {
             <label class="field">
               <span>串口</span>
               <div class="field-row">
-                <select id="port-select" ${locked ? "disabled" : ""}>
-                  ${renderPortOptions()}
-                </select>
+                ${renderPicker("port", pickerLabel("port"), locked)}
                 <button id="refresh-ports" class="secondary-button" type="button" ${locked ? "disabled" : ""}>刷新</button>
               </div>
             </label>
             <label class="field">
               <span>波特率</span>
-              <select id="baud-select" ${locked ? "disabled" : ""}>
-                ${baudRates
-                  .map(
-                    (rate) =>
-                      `<option value="${rate}"${selectedAttr(
-                        rate,
-                        state.config.baud_rate,
-                      )}>${rate}</option>`,
-                  )
-                  .join("")}
-              </select>
+              ${renderPicker("baud", pickerLabel("baud"), locked)}
             </label>
             <div class="field">
               <span>数据位</span>
@@ -247,7 +254,7 @@ function renderApp(): void {
             <div class="section-title">终端显示</div>
             <label class="field">
               <span>字体</span>
-              ${renderFontPicker()}
+              ${renderPicker("font", pickerLabel("font"), false)}
             </label>
             <label class="field range-field">
               <span>字号</span>
@@ -270,6 +277,7 @@ function renderApp(): void {
           <div id="terminal-host" class="terminal-host"></div>
         </section>
       </main>
+      ${renderPickerPortal()}
     </div>
   `;
 
@@ -301,7 +309,7 @@ function attachTerminal(): void {
 
   terminalInputDisposable?.dispose();
   terminalInputDisposable = terminal.onData((data) => {
-    void sendText(normalizeTerminalInput(data));
+    queueSerialText(normalizeTerminalInput(data));
   });
 
   host.addEventListener("contextmenu", (event) => {
@@ -313,18 +321,6 @@ function attachTerminal(): void {
 }
 
 function bindChromeEvents(): void {
-  const portSelect = document.querySelector<HTMLSelectElement>("#port-select");
-  portSelect?.addEventListener("change", () => {
-    state.config.port_name = portSelect.value;
-    saveSettings();
-  });
-
-  const baudSelect = document.querySelector<HTMLSelectElement>("#baud-select");
-  baudSelect?.addEventListener("change", () => {
-    state.config.baud_rate = Number(baudSelect.value);
-    saveSettings();
-  });
-
   document.querySelector("#refresh-ports")?.addEventListener("click", () => {
     void refreshPorts();
   });
@@ -352,7 +348,7 @@ function bindChromeEvents(): void {
     });
   });
 
-  bindFontPickerEvents();
+  bindPickerEvents();
 
   const fontSize = document.querySelector<HTMLInputElement>("#font-size");
   fontSize?.addEventListener("input", () => {
@@ -369,22 +365,6 @@ function bindChromeEvents(): void {
     saveSettings();
     applyTerminalOptions();
   });
-}
-
-function renderPortOptions(): string {
-  if (state.ports.length === 0) {
-    return `<option value="">未找到串口</option>`;
-  }
-
-  return state.ports
-    .map(
-      (port) =>
-        `<option value="${escapeAttribute(port)}"${selectedAttr(
-          port,
-          state.config.port_name,
-        )}>${escapeHtml(port)}</option>`,
-    )
-    .join("");
 }
 
 function renderSegment(
@@ -410,129 +390,251 @@ function renderSegment(
   `;
 }
 
-function renderFontPicker(): string {
+function renderPicker(id: PickerId, label: string, disabled: boolean): string {
   return `
-    <div class="font-combobox">
-      <button id="font-picker-button" class="font-picker-button" type="button" aria-haspopup="listbox" aria-expanded="${
-        state.fontDropdownOpen ? "true" : "false"
-      }">
-        <span>${escapeHtml(state.fontFamily)}</span>
-        <span class="font-picker-chevron">▼</span>
+    <div class="picker-anchor">
+      <button class="picker-button" data-picker-id="${id}" type="button" aria-haspopup="listbox" aria-expanded="${
+        state.activePicker === id ? "true" : "false"
+      }" ${disabled ? "disabled" : ""}>
+        <span>${escapeHtml(label)}</span>
+        <span class="picker-chevron">▼</span>
       </button>
-      ${
-        state.fontDropdownOpen
-          ? `<div class="font-menu">
-              <input id="font-search" class="font-search" type="search" placeholder="搜索字体" value="${escapeAttribute(
-                state.fontQuery,
-              )}" />
-              <div id="font-options" class="font-options" role="listbox">
-                ${renderFontOptions()}
-              </div>
-            </div>`
-          : ""
-      }
     </div>
   `;
 }
 
-function renderFontOptions(): string {
-  const fonts = filteredFonts();
-  if (fonts.length === 0) {
-    return `<div class="font-empty">没有匹配的字体</div>`;
+function renderPickerPortal(): string {
+  if (!state.activePicker || !state.pickerPosition) {
+    return "";
   }
 
-  return fonts
+  const position = state.pickerPosition;
+  return `
+    <div
+      id="picker-portal"
+      class="picker-menu ${position.placement}"
+      style="left: ${position.left}px; top: ${position.top}px; width: ${position.width}px; max-height: ${position.maxHeight}px"
+    >
+      <input
+        id="picker-search"
+        class="picker-search"
+        type="search"
+        placeholder="${escapeAttribute(pickerSearchPlaceholder(state.activePicker))}"
+        value="${escapeAttribute(state.pickerQuery)}"
+      />
+      <div id="picker-options" class="picker-options" style="max-height: ${Math.max(
+        60,
+        position.maxHeight - 42,
+      )}px" role="listbox">
+        ${renderPickerOptions()}
+      </div>
+    </div>
+  `;
+}
+
+function renderPickerOptions(): string {
+  const options = filteredPickerOptions();
+  if (options.length === 0) {
+    return `<div class="picker-empty">没有匹配项</div>`;
+  }
+
+  return options
     .map(
-      (font) =>
-        `<button type="button" class="font-option${
-          font === state.fontFamily ? " active" : ""
-        }" data-font="${escapeAttribute(font)}" role="option" aria-selected="${
-          font === state.fontFamily ? "true" : "false"
+      (option) =>
+        `<button type="button" class="picker-option${
+          isPickerOptionActive(option) ? " active" : ""
+        }" data-picker-value="${escapeAttribute(option.value)}" role="option" aria-selected="${
+          isPickerOptionActive(option) ? "true" : "false"
         }">
-          <span>${escapeHtml(font)}</span>
+          <span>${escapeHtml(option.label)}</span>
         </button>`,
     )
     .join("");
 }
 
-function bindFontPickerEvents(): void {
-  const button = document.querySelector<HTMLButtonElement>("#font-picker-button");
-  button?.addEventListener("click", () => {
-    state.fontDropdownOpen = !state.fontDropdownOpen;
-    if (state.fontDropdownOpen) {
-      state.fontQuery = "";
-    }
-    renderApp();
-    focusFontSearch();
+function bindPickerEvents(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-picker-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const pickerId = button.dataset.pickerId as PickerId | undefined;
+      if (pickerId) {
+        togglePicker(pickerId, button);
+      }
+    });
   });
 
-  const search = document.querySelector<HTMLInputElement>("#font-search");
+  const search = document.querySelector<HTMLInputElement>("#picker-search");
   search?.addEventListener("input", () => {
-    state.fontQuery = search.value;
-    renderFontOptionList();
+    state.pickerQuery = search.value;
+    renderPickerOptionList();
   });
   search?.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      state.fontDropdownOpen = false;
+      closePicker();
       renderApp();
       return;
     }
 
     if (event.key === "Enter") {
-      const firstFont = filteredFonts()[0];
-      if (firstFont) {
-        selectFont(firstFont);
+      const firstOption = filteredPickerOptions()[0];
+      if (firstOption && state.activePicker) {
+        selectPickerOption(state.activePicker, firstOption.value);
       }
     }
   });
 
-  bindFontOptionButtons();
+  bindPickerOptionButtons();
 }
 
-function renderFontOptionList(): void {
-  const list = document.querySelector<HTMLDivElement>("#font-options");
+function renderPickerOptionList(): void {
+  const list = document.querySelector<HTMLDivElement>("#picker-options");
   if (!list) {
     return;
   }
 
-  list.innerHTML = renderFontOptions();
-  bindFontOptionButtons();
+  list.innerHTML = renderPickerOptions();
+  bindPickerOptionButtons();
 }
 
-function bindFontOptionButtons(): void {
-  document.querySelectorAll<HTMLButtonElement>(".font-option").forEach((button) => {
+function bindPickerOptionButtons(): void {
+  document.querySelectorAll<HTMLButtonElement>(".picker-option").forEach((button) => {
     button.addEventListener("click", () => {
-      const font = button.dataset.font;
-      if (font) {
-        selectFont(font);
+      const value = button.dataset.pickerValue;
+      if (value && state.activePicker) {
+        selectPickerOption(state.activePicker, value);
       }
     });
   });
 }
 
-function selectFont(font: string): void {
-  state.fontFamily = font;
-  state.fontDropdownOpen = false;
-  state.fontQuery = "";
-  state.availableFonts = mergeFonts([font, ...state.availableFonts]);
+function togglePicker(id: PickerId, button: HTMLElement): void {
+  if (state.activePicker === id) {
+    closePicker();
+    renderApp();
+    return;
+  }
+
+  state.activePicker = id;
+  state.pickerQuery = "";
+  state.pickerPosition = calculatePickerPosition(button, pickerOptions(id).length);
+  renderApp();
+  focusPickerSearch();
+}
+
+function closePicker(): void {
+  state.activePicker = null;
+  state.pickerQuery = "";
+  state.pickerPosition = null;
+}
+
+function selectPickerOption(id: PickerId, value: string): void {
+  if (id === "port") {
+    state.config.port_name = value;
+  } else if (id === "baud") {
+    state.config.baud_rate = Number(value);
+  } else {
+    state.fontFamily = value;
+    state.availableFonts = mergeFonts([value, ...state.availableFonts]);
+    applyTerminalOptions();
+  }
+
+  closePicker();
   saveSettings();
-  applyTerminalOptions();
   renderApp();
 }
 
-function filteredFonts(): string[] {
-  const query = state.fontQuery.trim().toLocaleLowerCase();
-  const fonts = mergeFonts([state.fontFamily, ...state.availableFonts]);
-  if (query.length === 0) {
-    return fonts;
+function pickerLabel(id: PickerId): string {
+  if (id === "port") {
+    return state.config.port_name || "未找到串口";
   }
-
-  return fonts.filter((font) => font.toLocaleLowerCase().includes(query));
+  if (id === "baud") {
+    return String(state.config.baud_rate);
+  }
+  return state.fontFamily;
 }
 
-function focusFontSearch(): void {
+function pickerOptions(id: PickerId): PickerOption[] {
+  if (id === "port") {
+    return state.ports.map((port) => ({ label: port, value: port }));
+  }
+
+  if (id === "baud") {
+    return baudRates.map((rate) => ({ label: String(rate), value: String(rate) }));
+  }
+
+  return mergeFonts([state.fontFamily, ...state.availableFonts]).map((font) => ({
+    label: font,
+    value: font,
+  }));
+}
+
+function filteredPickerOptions(): PickerOption[] {
+  if (!state.activePicker) {
+    return [];
+  }
+
+  const query = state.pickerQuery.trim().toLocaleLowerCase();
+  const options = pickerOptions(state.activePicker);
+  if (query.length === 0) {
+    return options;
+  }
+
+  return options.filter((option) => option.label.toLocaleLowerCase().includes(query));
+}
+
+function isPickerOptionActive(option: PickerOption): boolean {
+  if (state.activePicker === "port") {
+    return option.value === state.config.port_name;
+  }
+  if (state.activePicker === "baud") {
+    return Number(option.value) === state.config.baud_rate;
+  }
+  return option.value === state.fontFamily;
+}
+
+function pickerSearchPlaceholder(id: PickerId): string {
+  if (id === "port") {
+    return "搜索串口";
+  }
+  if (id === "baud") {
+    return "搜索波特率";
+  }
+  return "搜索字体";
+}
+
+function calculatePickerPosition(button: HTMLElement, optionCount: number): DropdownPosition {
+  const rect = button.getBoundingClientRect();
+  const scale = currentScale();
+  const margin = 8;
+  const gap = 6;
+  const searchHeight = 38 * scale;
+  const rowHeight = 34 * scale;
+  const menuPadding = 8 * scale;
+  const desiredHeight = searchHeight + Math.min(Math.max(optionCount, 1), 7) * rowHeight + menuPadding;
+  const width = Math.min(
+    Math.max(rect.width, Math.min(260, window.innerWidth - margin * 2)),
+    window.innerWidth - margin * 2,
+  );
+  const left = clamp(rect.left, margin, window.innerWidth - width - margin);
+  const availableDown = window.innerHeight - rect.bottom - gap - margin;
+  const availableUp = rect.top - gap - margin;
+  const openUp = availableDown < Math.min(desiredHeight, 180 * scale) && availableUp > availableDown;
+  const available = Math.max(72, openUp ? availableUp : availableDown);
+  const maxHeight = Math.min(desiredHeight, available, window.innerHeight - margin * 2);
+  const preferredTop = openUp ? rect.top - gap - maxHeight : rect.bottom + gap;
+  const top = clamp(preferredTop, margin, window.innerHeight - maxHeight - margin);
+
+  return {
+    left,
+    top,
+    width,
+    maxHeight,
+    placement: openUp ? "up" : "down",
+  };
+}
+
+function focusPickerSearch(): void {
   requestAnimationFrame(() => {
-    const search = document.querySelector<HTMLInputElement>("#font-search");
+    const search = document.querySelector<HTMLInputElement>("#picker-search");
     search?.focus();
     search?.select();
   });
@@ -608,6 +710,7 @@ async function connectSerial(): Promise<void> {
 
   state.mode = "connecting";
   state.lastError = "";
+  clearPendingSerialText();
   renderApp();
 
   try {
@@ -626,6 +729,7 @@ async function connectSerial(): Promise<void> {
 }
 
 async function disconnectSerial(): Promise<void> {
+  clearPendingSerialText();
   try {
     await invoke<void>("disconnect");
   } catch (error) {
@@ -637,10 +741,38 @@ async function disconnectSerial(): Promise<void> {
   renderApp();
 }
 
-async function sendText(text: string): Promise<void> {
+function queueSerialText(text: string): void {
   if (state.mode !== "connected" || text.length === 0) {
     return;
   }
+
+  pendingSerialText += text;
+  scheduleSerialFlush(shouldFlushImmediately(text) ? 0 : 6);
+}
+
+function shouldFlushImmediately(text: string): boolean {
+  return /[\r\u0003\u0004\u001a]/.test(text);
+}
+
+function scheduleSerialFlush(delayMs: number): void {
+  if (serialFlushTimer !== null) {
+    return;
+  }
+
+  serialFlushTimer = window.setTimeout(() => {
+    serialFlushTimer = null;
+    void flushSerialText();
+  }, delayMs);
+}
+
+async function flushSerialText(): Promise<void> {
+  if (serialWriteInFlight || pendingSerialText.length === 0) {
+    return;
+  }
+
+  const text = pendingSerialText;
+  pendingSerialText = "";
+  serialWriteInFlight = true;
 
   try {
     state.txBytes = await invoke<number>("write_text", { text });
@@ -650,6 +782,19 @@ async function sendText(text: string): Promise<void> {
     state.mode = "error";
     terminal.writeln(`\x1b[31m${state.lastError}\x1b[0m`);
     renderApp();
+  } finally {
+    serialWriteInFlight = false;
+    if (pendingSerialText.length > 0) {
+      scheduleSerialFlush(0);
+    }
+  }
+}
+
+function clearPendingSerialText(): void {
+  pendingSerialText = "";
+  if (serialFlushTimer !== null) {
+    window.clearTimeout(serialFlushTimer);
+    serialFlushTimer = null;
   }
 }
 
@@ -674,6 +819,19 @@ function updateScale(): void {
     Math.max(0.55, Math.min(window.innerWidth / 1440, window.innerHeight / 850)),
   );
   document.documentElement.style.setProperty("--ui-scale", scale.toFixed(3));
+}
+
+function currentScale(): number {
+  return Number.parseFloat(
+    getComputedStyle(document.documentElement).getPropertyValue("--ui-scale"),
+  ) || 1;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (max < min) {
+    return min;
+  }
+  return Math.min(Math.max(value, min), max);
 }
 
 function queueFit(): void {
@@ -847,10 +1005,6 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024).toFixed(1)} KB`;
 }
 
-function selectedAttr<T extends string | number>(value: T, current: T): string {
-  return value === current ? " selected" : "";
-}
-
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -879,6 +1033,7 @@ async function setupBackendListeners(): Promise<void> {
   await listen<SerialErrorPayload>("serial-error", (event) => {
     state.mode = "error";
     state.lastError = event.payload.message;
+    clearPendingSerialText();
     terminal.writeln(`\x1b[31m${event.payload.message}\x1b[0m`);
     void invoke<void>("disconnect");
     renderApp();
@@ -887,20 +1042,30 @@ async function setupBackendListeners(): Promise<void> {
 
 window.addEventListener("resize", () => {
   updateScale();
+  if (state.activePicker) {
+    const button = document.querySelector<HTMLElement>(`[data-picker-id="${state.activePicker}"]`);
+    if (button) {
+      state.pickerPosition = calculatePickerPosition(
+        button,
+        pickerOptions(state.activePicker).length,
+      );
+      renderApp();
+    }
+  }
   queueFit();
 });
 
 document.addEventListener("pointerdown", (event) => {
-  if (!state.fontDropdownOpen) {
+  if (!state.activePicker) {
     return;
   }
 
   const target = event.target;
-  if (target instanceof Element && target.closest(".font-combobox")) {
+  if (target instanceof Element && (target.closest(".picker-anchor") || target.closest("#picker-portal"))) {
     return;
   }
 
-  state.fontDropdownOpen = false;
+  closePicker();
   renderApp();
 });
 

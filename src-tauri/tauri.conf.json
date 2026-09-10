@@ -14,8 +14,8 @@
     "windows": [
       {
         "title": "Serial Terminal",
-        "width": 1440,
-        "height": 850,
+        "width": 1500,
+        "height": 960,
         "minWidth": 720,
         "minHeight": 480
       }
