@@ -13,6 +13,9 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, State};
 
+#[cfg(windows)]
+mod windows_serial;
+
 const SERIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
 const SERIAL_READ_TIMEOUT_MS: u64 = 5;
 const SERIAL_EMIT_INTERVAL_MS: u64 = 2;
@@ -29,6 +32,7 @@ struct SerialManager {
 struct SerialState {
     reader_stop: Option<Arc<AtomicBool>>,
     reader: Option<JoinHandle<()>>,
+    writer_stop: Option<Arc<AtomicBool>>,
     writer_tx: Option<mpsc::Sender<Vec<u8>>>,
     writer: Option<JoinHandle<()>>,
 }
@@ -71,9 +75,7 @@ fn connect(
     manager: State<'_, SerialManager>,
     config: SerialConfig,
 ) -> Result<(), String> {
-    let data_bits = map_data_bits(config.data_bits)?;
-    let parity = map_parity(&config.parity)?;
-    let stop_bits = map_stop_bits(config.stop_bits)?;
+    validate_serial_config(&config)?;
 
     {
         let mut state = manager
@@ -82,6 +84,39 @@ fn connect(
             .map_err(|_| "串口状态锁已损坏".to_string())?;
         close_locked(&mut state);
     }
+
+    #[cfg(windows)]
+    let (reader_port, writer_port) = windows_serial::open_serial_pair(&config)?;
+
+    #[cfg(not(windows))]
+    let (reader_port, writer_port) = open_serial_pair(&config)?;
+
+    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
+    let writer_stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let reader_handle = spawn_reader(app.clone(), reader_port, Arc::clone(&reader_stop));
+    let writer_handle = spawn_writer(app, writer_port, writer_rx, Arc::clone(&writer_stop));
+
+    let mut state = manager
+        .inner
+        .lock()
+        .map_err(|_| "串口状态锁已损坏".to_string())?;
+    state.reader_stop = Some(reader_stop);
+    state.reader = Some(reader_handle);
+    state.writer_stop = Some(writer_stop);
+    state.writer_tx = Some(writer_tx);
+    state.writer = Some(writer_handle);
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_serial_pair(
+    config: &SerialConfig,
+) -> Result<(Box<dyn SerialPort>, Box<dyn SerialPort>), String> {
+    let data_bits = map_data_bits(config.data_bits)?;
+    let parity = map_parity(&config.parity)?;
+    let stop_bits = map_stop_bits(config.stop_bits)?;
 
     let port = serialport::new(&config.port_name, config.baud_rate)
         .data_bits(data_bits)
@@ -95,21 +130,7 @@ fn connect(
         .try_clone()
         .map_err(|error| format!("创建串口读取通道失败: {error}"))?;
 
-    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
-    let reader_stop = Arc::new(AtomicBool::new(false));
-    let reader_handle = spawn_reader(app.clone(), reader_port, Arc::clone(&reader_stop));
-    let writer_handle = spawn_writer(app, port, writer_rx);
-
-    let mut state = manager
-        .inner
-        .lock()
-        .map_err(|_| "串口状态锁已损坏".to_string())?;
-    state.reader_stop = Some(reader_stop);
-    state.reader = Some(reader_handle);
-    state.writer_tx = Some(writer_tx);
-    state.writer = Some(writer_handle);
-
-    Ok(())
+    Ok((reader_port, port))
 }
 
 #[tauri::command]
@@ -149,11 +170,10 @@ fn report_perf(message: String) {
     eprintln!("[serial-terminal perf] {message}");
 }
 
-fn spawn_reader(
-    app: AppHandle,
-    mut port: Box<dyn SerialPort>,
-    reader_stop: Arc<AtomicBool>,
-) -> JoinHandle<()> {
+fn spawn_reader<R>(app: AppHandle, mut port: R, reader_stop: Arc<AtomicBool>) -> JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
     thread::spawn(move || {
         let mut buffer = [0_u8; SERIAL_READ_BUFFER_SIZE];
         let mut pending = Vec::with_capacity(SERIAL_READ_BUFFER_SIZE);
@@ -194,20 +214,49 @@ fn spawn_reader(
     })
 }
 
-fn spawn_writer(
+trait SerialWriterPort: Send + 'static {
+    fn write_all_serial(&mut self, bytes: &[u8], stop: &AtomicBool) -> std::io::Result<()>;
+}
+
+impl SerialWriterPort for Box<dyn SerialPort> {
+    fn write_all_serial(&mut self, bytes: &[u8], _stop: &AtomicBool) -> std::io::Result<()> {
+        self.write_all(bytes)
+    }
+}
+
+#[cfg(windows)]
+impl SerialWriterPort for windows_serial::WindowsSerialPort {
+    fn write_all_serial(&mut self, bytes: &[u8], stop: &AtomicBool) -> std::io::Result<()> {
+        self.write_all(bytes, stop)
+    }
+}
+
+fn spawn_writer<W>(
     app: AppHandle,
-    mut port: Box<dyn SerialPort>,
+    mut port: W,
     writer_rx: mpsc::Receiver<Vec<u8>>,
-) -> JoinHandle<()> {
+    writer_stop: Arc<AtomicBool>,
+) -> JoinHandle<()>
+where
+    W: SerialWriterPort,
+{
     thread::spawn(move || {
-        while let Ok(mut bytes) = writer_rx.recv() {
+        while !writer_stop.load(Ordering::Relaxed) {
+            let Ok(mut bytes) = writer_rx.recv() else {
+                break;
+            };
+
             if bytes.is_empty() {
                 continue;
             }
 
             let packets = drain_serial_writer_queue(&writer_rx, &mut bytes);
             let start = Instant::now();
-            if let Err(error) = port.write_all(&bytes) {
+            if let Err(error) = port.write_all_serial(&bytes, &writer_stop) {
+                if writer_stop.load(Ordering::Relaxed) && error.kind() == ErrorKind::Interrupted {
+                    break;
+                }
+
                 let _ = app.emit(
                     "serial-error",
                     SerialError {
@@ -220,7 +269,7 @@ fn spawn_writer(
             let elapsed = start.elapsed();
             if elapsed.as_millis() > SERIAL_PERF_WARN_MS {
                 eprintln!(
-                    "[serial-terminal perf] serial write blocked for {}ms, bytes={}, packets={}",
+                    "[serial-terminal perf] serial write completed in {}ms, bytes={}, packets={}",
                     elapsed.as_millis(),
                     bytes.len(),
                     packets
@@ -280,6 +329,10 @@ fn close_locked(state: &mut SerialState) {
         reader_stop.store(true, Ordering::Relaxed);
     }
 
+    if let Some(writer_stop) = state.writer_stop.take() {
+        writer_stop.store(true, Ordering::Relaxed);
+    }
+
     state.writer_tx.take();
 
     if let Some(writer) = state.writer.take() {
@@ -289,6 +342,13 @@ fn close_locked(state: &mut SerialState) {
     if let Some(reader) = state.reader.take() {
         let _ = reader.join();
     }
+}
+
+fn validate_serial_config(config: &SerialConfig) -> Result<(), String> {
+    map_data_bits(config.data_bits)?;
+    map_parity(&config.parity)?;
+    map_stop_bits(config.stop_bits)?;
+    Ok(())
 }
 
 fn map_data_bits(value: u8) -> Result<DataBits, String> {
