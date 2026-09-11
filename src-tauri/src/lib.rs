@@ -17,6 +17,7 @@ const SERIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
 const SERIAL_READ_TIMEOUT_MS: u64 = 5;
 const SERIAL_EMIT_INTERVAL_MS: u64 = 2;
 const SERIAL_EMIT_BUFFER_LIMIT: usize = 4 * 1024;
+const SERIAL_WRITE_BUFFER_LIMIT: usize = 256;
 const SERIAL_PERF_WARN_MS: u128 = 25;
 
 #[derive(Default)]
@@ -199,11 +200,12 @@ fn spawn_writer(
     writer_rx: mpsc::Receiver<Vec<u8>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        while let Ok(bytes) = writer_rx.recv() {
+        while let Ok(mut bytes) = writer_rx.recv() {
             if bytes.is_empty() {
                 continue;
             }
 
+            let packets = drain_serial_writer_queue(&writer_rx, &mut bytes);
             let start = Instant::now();
             if let Err(error) = port.write_all(&bytes) {
                 let _ = app.emit(
@@ -218,13 +220,34 @@ fn spawn_writer(
             let elapsed = start.elapsed();
             if elapsed.as_millis() > SERIAL_PERF_WARN_MS {
                 eprintln!(
-                    "[serial-terminal perf] serial write blocked for {}ms, bytes={}",
+                    "[serial-terminal perf] serial write blocked for {}ms, bytes={}, packets={}",
                     elapsed.as_millis(),
-                    bytes.len()
+                    bytes.len(),
+                    packets
                 );
             }
         }
     })
+}
+
+fn drain_serial_writer_queue(writer_rx: &mpsc::Receiver<Vec<u8>>, pending: &mut Vec<u8>) -> usize {
+    let mut packets = 1;
+
+    while pending.len() < SERIAL_WRITE_BUFFER_LIMIT {
+        match writer_rx.try_recv() {
+            Ok(bytes) => {
+                if bytes.is_empty() {
+                    continue;
+                }
+                pending.extend_from_slice(&bytes);
+                packets += 1;
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    packets
 }
 
 fn emit_serial_data(app: &AppHandle, pending: &mut Vec<u8>) {
