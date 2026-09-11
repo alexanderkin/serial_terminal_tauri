@@ -43,7 +43,7 @@ interface SerialConfig {
 }
 
 interface SerialDataPayload {
-  data: number[];
+  data: string;
   byte_count: number;
 }
 
@@ -100,9 +100,10 @@ const fallbackFontFamilies = [
 ];
 
 const storageKey = "serial-terminal-settings-v1";
-const serialWriteChunkSize = 256;
-const serialWriteMaxInFlight = 8;
+const serialWriteChunkSize = 64;
+const serialWriteMaxChunksPerPump = 4;
 const terminalMenuMargin = 8;
+const textEncoder = new TextEncoder();
 const savedSettings = readSavedSettings();
 const state: AppState = {
   ports: [],
@@ -187,7 +188,8 @@ let terminalInputDisposable: { dispose(): void } | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let fitQueued = false;
 let pendingSerialText = "";
-let serialWritesInFlight = 0;
+let serialWritePumpQueued = false;
+let serialWritePumpTimer: number | null = null;
 let terminalContextMenu: TerminalContextMenuState | null = null;
 let pendingStatsUpdate = false;
 
@@ -903,42 +905,69 @@ function queueSerialText(text: string): void {
   }
 
   pendingSerialText += text;
-  flushSerialText();
+  queueSerialWritePump();
 }
 
-function flushSerialText(): void {
-  if (pendingSerialText.length === 0 || serialWritesInFlight >= serialWriteMaxInFlight) {
+function queueSerialWritePump(deferToTimer = false): void {
+  if (serialWritePumpQueued) {
     return;
   }
 
-  while (pendingSerialText.length > 0 && serialWritesInFlight < serialWriteMaxInFlight) {
+  serialWritePumpQueued = true;
+  if (deferToTimer) {
+    serialWritePumpTimer = window.setTimeout(flushSerialText, 0);
+  } else {
+    queueMicrotask(flushSerialText);
+  }
+}
+
+function flushSerialText(): void {
+  serialWritePumpQueued = false;
+  serialWritePumpTimer = null;
+
+  if (pendingSerialText.length === 0 || state.mode !== "connected") {
+    return;
+  }
+
+  let chunksSent = 0;
+  while (pendingSerialText.length > 0 && chunksSent < serialWriteMaxChunksPerPump) {
     const text = pendingSerialText.slice(0, serialWriteChunkSize);
     pendingSerialText = pendingSerialText.slice(text.length);
-    serialWritesInFlight += 1;
     void writeSerialChunk(text);
+    chunksSent += 1;
+  }
+
+  if (pendingSerialText.length > 0) {
+    queueSerialWritePump(true);
   }
 }
 
 async function writeSerialChunk(text: string): Promise<void> {
+  state.txBytes += textEncoder.encode(text).byteLength;
+  requestStatsUpdate();
+
   try {
-    const txBytes = await invoke<number>("write_text", { text });
-    state.txBytes = Math.max(state.txBytes, txBytes);
-    requestStatsUpdate();
+    await invoke<void>("write_text", { text });
   } catch (error) {
+    if (state.mode !== "connected") {
+      return;
+    }
+
     state.lastError = toMessage(error);
     state.mode = "error";
+    clearPendingSerialText();
     terminal.writeln(`\x1b[31m${state.lastError}\x1b[0m`);
     renderApp();
-  } finally {
-    serialWritesInFlight = Math.max(0, serialWritesInFlight - 1);
-    if (pendingSerialText.length > 0 && state.mode === "connected") {
-      flushSerialText();
-    }
   }
 }
 
 function clearPendingSerialText(): void {
   pendingSerialText = "";
+  serialWritePumpQueued = false;
+  if (serialWritePumpTimer !== null) {
+    window.clearTimeout(serialWritePumpTimer);
+    serialWritePumpTimer = null;
+  }
 }
 
 function normalizeTerminalInput(data: string): string {
@@ -1014,18 +1043,29 @@ function requestStatsUpdate(): void {
   });
 }
 
-function queueSerialOutput(data: number[], byteCount: number): void {
+function queueSerialOutput(data: string, byteCount: number): void {
   if (data.length === 0 && byteCount === 0) {
     return;
   }
 
   if (data.length > 0) {
-    terminal.write(new Uint8Array(data));
+    terminal.write(decodeBase64Bytes(data));
   }
   if (byteCount > 0) {
     state.rxBytes += byteCount;
     requestStatsUpdate();
   }
+}
+
+function decodeBase64Bytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return bytes;
 }
 
 function updateOutput(selector: string, text: string): void {

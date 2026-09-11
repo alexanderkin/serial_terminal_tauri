@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serialport::{DataBits, Parity, SerialPort, StopBits};
 use std::{
@@ -26,7 +27,6 @@ struct SerialState {
     reader: Option<JoinHandle<()>>,
     writer_tx: Option<mpsc::Sender<Vec<u8>>>,
     writer: Option<JoinHandle<()>>,
-    tx_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -40,7 +40,7 @@ struct SerialConfig {
 
 #[derive(Clone, Debug, Serialize)]
 struct SerialData {
-    data: Vec<u8>,
+    data: String,
     byte_count: u64,
 }
 
@@ -104,7 +104,6 @@ fn connect(
     state.reader = Some(reader_handle);
     state.writer_tx = Some(writer_tx);
     state.writer = Some(writer_handle);
-    state.tx_bytes = 0;
 
     Ok(())
 }
@@ -120,24 +119,25 @@ fn disconnect(manager: State<'_, SerialManager>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn write_text(manager: State<'_, SerialManager>, text: String) -> Result<u64, String> {
+fn write_text(manager: State<'_, SerialManager>, text: String) -> Result<(), String> {
     let bytes = text.into_bytes();
-    let byte_count = bytes.len() as u64;
-    let mut state = manager
-        .inner
-        .lock()
-        .map_err(|_| "串口状态锁已损坏".to_string())?;
-    let writer_tx = state
-        .writer_tx
-        .as_ref()
-        .ok_or_else(|| "串口未连接".to_string())?;
+    let writer_tx = {
+        let state = manager
+            .inner
+            .lock()
+            .map_err(|_| "串口状态锁已损坏".to_string())?;
+        state
+            .writer_tx
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "串口未连接".to_string())?
+    };
 
     writer_tx
         .send(bytes)
         .map_err(|_| "串口写入通道已关闭".to_string())?;
-    state.tx_bytes += byte_count;
 
-    Ok(state.tx_bytes)
+    Ok(())
 }
 
 fn spawn_reader(
@@ -153,7 +153,7 @@ fn spawn_reader(
                 Ok(0) => {}
                 Ok(byte_count) => {
                     let payload = SerialData {
-                        data: buffer[..byte_count].to_vec(),
+                        data: BASE64_STANDARD.encode(&buffer[..byte_count]),
                         byte_count: byte_count as u64,
                     };
                     let _ = app.emit("serial-data", payload);
@@ -211,8 +211,6 @@ fn close_locked(state: &mut SerialState) {
     if let Some(reader) = state.reader.take() {
         let _ = reader.join();
     }
-
-    state.tx_bytes = 0;
 }
 
 fn map_data_bits(value: u8) -> Result<DataBits, String> {
