@@ -9,12 +9,15 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, State};
 
 const SERIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
 const SERIAL_READ_TIMEOUT_MS: u64 = 5;
+const SERIAL_EMIT_INTERVAL_MS: u64 = 2;
+const SERIAL_EMIT_BUFFER_LIMIT: usize = 4 * 1024;
+const SERIAL_PERF_WARN_MS: u128 = 25;
 
 #[derive(Default)]
 struct SerialManager {
@@ -140,6 +143,11 @@ fn write_text(manager: State<'_, SerialManager>, text: String) -> Result<(), Str
     Ok(())
 }
 
+#[tauri::command]
+fn report_perf(message: String) {
+    eprintln!("[serial-terminal perf] {message}");
+}
+
 fn spawn_reader(
     app: AppHandle,
     mut port: Box<dyn SerialPort>,
@@ -147,19 +155,31 @@ fn spawn_reader(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0_u8; SERIAL_READ_BUFFER_SIZE];
+        let mut pending = Vec::with_capacity(SERIAL_READ_BUFFER_SIZE);
+        let mut last_emit = Instant::now();
 
         while !reader_stop.load(Ordering::Relaxed) {
             match port.read(&mut buffer) {
                 Ok(0) => {}
                 Ok(byte_count) => {
-                    let payload = SerialData {
-                        data: BASE64_STANDARD.encode(&buffer[..byte_count]),
-                        byte_count: byte_count as u64,
-                    };
-                    let _ = app.emit("serial-data", payload);
+                    pending.extend_from_slice(&buffer[..byte_count]);
+                    if pending.len() >= SERIAL_EMIT_BUFFER_LIMIT
+                        || last_emit.elapsed() >= Duration::from_millis(SERIAL_EMIT_INTERVAL_MS)
+                    {
+                        emit_serial_data(&app, &mut pending);
+                        last_emit = Instant::now();
+                    }
                 }
-                Err(error) if error.kind() == ErrorKind::TimedOut => {}
+                Err(error) if error.kind() == ErrorKind::TimedOut => {
+                    if !pending.is_empty() {
+                        emit_serial_data(&app, &mut pending);
+                        last_emit = Instant::now();
+                    }
+                }
                 Err(error) => {
+                    if !pending.is_empty() {
+                        emit_serial_data(&app, &mut pending);
+                    }
                     let _ = app.emit(
                         "serial-error",
                         SerialError {
@@ -184,6 +204,7 @@ fn spawn_writer(
                 continue;
             }
 
+            let start = Instant::now();
             if let Err(error) = port.write_all(&bytes) {
                 let _ = app.emit(
                     "serial-error",
@@ -193,8 +214,42 @@ fn spawn_writer(
                 );
                 break;
             }
+
+            let elapsed = start.elapsed();
+            if elapsed.as_millis() > SERIAL_PERF_WARN_MS {
+                eprintln!(
+                    "[serial-terminal perf] serial write blocked for {}ms, bytes={}",
+                    elapsed.as_millis(),
+                    bytes.len()
+                );
+            }
         }
     })
+}
+
+fn emit_serial_data(app: &AppHandle, pending: &mut Vec<u8>) {
+    if pending.is_empty() {
+        return;
+    }
+
+    let start = Instant::now();
+    let byte_count = pending.len() as u64;
+    let payload = SerialData {
+        data: BASE64_STANDARD.encode(pending.as_slice()),
+        byte_count,
+    };
+    let _ = app.emit("serial-data", payload);
+    let elapsed = start.elapsed();
+
+    if elapsed.as_millis() > SERIAL_PERF_WARN_MS {
+        eprintln!(
+            "[serial-terminal perf] serial-data emit took {}ms, bytes={}",
+            elapsed.as_millis(),
+            byte_count
+        );
+    }
+
+    pending.clear();
 }
 
 fn close_locked(state: &mut SerialState) {
@@ -314,7 +369,12 @@ pub fn run() {
         .manage(SerialManager::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            list_fonts, list_ports, connect, disconnect, write_text
+            list_fonts,
+            list_ports,
+            connect,
+            disconnect,
+            write_text,
+            report_perf
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

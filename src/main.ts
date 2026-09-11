@@ -102,6 +102,10 @@ const fallbackFontFamilies = [
 const storageKey = "serial-terminal-settings-v1";
 const serialWriteChunkSize = 64;
 const serialWriteMaxChunksPerPump = 4;
+const serialWriteMaxInFlight = 8;
+const terminalOutputChunkBytes = 64 * 1024;
+const perfWarnMs = 50;
+const mainThreadLagWarnMs = 120;
 const terminalMenuMargin = 8;
 const textEncoder = new TextEncoder();
 const savedSettings = readSavedSettings();
@@ -190,8 +194,14 @@ let fitQueued = false;
 let pendingSerialText = "";
 let serialWritePumpQueued = false;
 let serialWritePumpTimer: number | null = null;
+let serialWritesInFlight = 0;
+let pendingTerminalOutput: Uint8Array[] = [];
+let pendingTerminalOutputIndex = 0;
+let pendingTerminalOutputBytes = 0;
+let terminalOutputWriting = false;
 let terminalContextMenu: TerminalContextMenuState | null = null;
 let pendingStatsUpdate = false;
+let lastPerfReportAt = 0;
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
@@ -869,6 +879,7 @@ async function connectSerial(): Promise<void> {
   state.mode = "connecting";
   state.lastError = "";
   clearPendingSerialText();
+  clearPendingTerminalOutput();
   renderApp();
 
   try {
@@ -888,6 +899,7 @@ async function connectSerial(): Promise<void> {
 
 async function disconnectSerial(): Promise<void> {
   clearPendingSerialText();
+  clearPendingTerminalOutput();
   try {
     await invoke<void>("disconnect");
   } catch (error) {
@@ -925,19 +937,28 @@ function flushSerialText(): void {
   serialWritePumpQueued = false;
   serialWritePumpTimer = null;
 
-  if (pendingSerialText.length === 0 || state.mode !== "connected") {
+  if (
+    pendingSerialText.length === 0 ||
+    state.mode !== "connected" ||
+    serialWritesInFlight >= serialWriteMaxInFlight
+  ) {
     return;
   }
 
   let chunksSent = 0;
-  while (pendingSerialText.length > 0 && chunksSent < serialWriteMaxChunksPerPump) {
+  while (
+    pendingSerialText.length > 0 &&
+    chunksSent < serialWriteMaxChunksPerPump &&
+    serialWritesInFlight < serialWriteMaxInFlight
+  ) {
     const text = pendingSerialText.slice(0, serialWriteChunkSize);
     pendingSerialText = pendingSerialText.slice(text.length);
+    serialWritesInFlight += 1;
     void writeSerialChunk(text);
     chunksSent += 1;
   }
 
-  if (pendingSerialText.length > 0) {
+  if (pendingSerialText.length > 0 && serialWritesInFlight < serialWriteMaxInFlight) {
     queueSerialWritePump(true);
   }
 }
@@ -946,8 +967,13 @@ async function writeSerialChunk(text: string): Promise<void> {
   state.txBytes += textEncoder.encode(text).byteLength;
   requestStatsUpdate();
 
+  const start = performance.now();
   try {
     await invoke<void>("write_text", { text });
+    const elapsed = performance.now() - start;
+    if (elapsed > perfWarnMs) {
+      reportPerf(`tx ipc took ${elapsed.toFixed(1)}ms, chars=${text.length}`);
+    }
   } catch (error) {
     if (state.mode !== "connected") {
       return;
@@ -956,18 +982,31 @@ async function writeSerialChunk(text: string): Promise<void> {
     state.lastError = toMessage(error);
     state.mode = "error";
     clearPendingSerialText();
+    clearPendingTerminalOutput();
     terminal.writeln(`\x1b[31m${state.lastError}\x1b[0m`);
     renderApp();
+  } finally {
+    serialWritesInFlight = Math.max(0, serialWritesInFlight - 1);
+    if (pendingSerialText.length > 0 && state.mode === "connected") {
+      queueSerialWritePump();
+    }
   }
 }
 
 function clearPendingSerialText(): void {
   pendingSerialText = "";
   serialWritePumpQueued = false;
+  serialWritesInFlight = 0;
   if (serialWritePumpTimer !== null) {
     window.clearTimeout(serialWritePumpTimer);
     serialWritePumpTimer = null;
   }
+}
+
+function clearPendingTerminalOutput(): void {
+  pendingTerminalOutput = [];
+  pendingTerminalOutputIndex = 0;
+  pendingTerminalOutputBytes = 0;
 }
 
 function normalizeTerminalInput(data: string): string {
@@ -1043,18 +1082,115 @@ function requestStatsUpdate(): void {
   });
 }
 
+function startPerformanceProbe(): void {
+  let lastTick = performance.now();
+  window.setInterval(() => {
+    const now = performance.now();
+    const lag = now - lastTick - 250;
+    lastTick = now;
+
+    if (lag > mainThreadLagWarnMs) {
+      reportPerf(`main thread stalled ${lag.toFixed(1)}ms`);
+    }
+  }, 250);
+}
+
+function reportPerf(message: string): void {
+  const now = performance.now();
+  if (now - lastPerfReportAt < 500) {
+    return;
+  }
+
+  lastPerfReportAt = now;
+  console.warn(`[serial-terminal perf] ${message}`);
+  void invoke<void>("report_perf", { message }).catch(() => {});
+}
+
 function queueSerialOutput(data: string, byteCount: number): void {
   if (data.length === 0 && byteCount === 0) {
     return;
   }
 
   if (data.length > 0) {
-    terminal.write(decodeBase64Bytes(data));
+    const start = performance.now();
+    const bytes = decodeBase64Bytes(data);
+    const elapsed = performance.now() - start;
+    if (elapsed > perfWarnMs) {
+      reportPerf(`rx base64 decode took ${elapsed.toFixed(1)}ms, bytes=${bytes.byteLength}`);
+    }
+    pendingTerminalOutput.push(bytes);
+    pendingTerminalOutputBytes += bytes.byteLength;
+    drainTerminalOutput();
   }
   if (byteCount > 0) {
     state.rxBytes += byteCount;
     requestStatsUpdate();
   }
+}
+
+function drainTerminalOutput(): void {
+  if (terminalOutputWriting || pendingTerminalOutputBytes === 0) {
+    return;
+  }
+
+  const bytes = takeTerminalOutputChunk();
+  terminalOutputWriting = true;
+  const start = performance.now();
+  terminal.write(bytes, () => {
+    terminalOutputWriting = false;
+    const elapsed = performance.now() - start;
+    if (elapsed > perfWarnMs) {
+      reportPerf(
+        `xterm write took ${elapsed.toFixed(1)}ms, bytes=${bytes.byteLength}, queued=${pendingTerminalOutputBytes}`,
+      );
+    }
+
+    if (pendingTerminalOutputBytes > 0) {
+      queueMicrotask(drainTerminalOutput);
+    }
+  });
+}
+
+function takeTerminalOutputChunk(): Uint8Array {
+  const targetLength = Math.min(pendingTerminalOutputBytes, terminalOutputChunkBytes);
+  if (
+    pendingTerminalOutputIndex === pendingTerminalOutput.length - 1 &&
+    pendingTerminalOutput[pendingTerminalOutputIndex].byteLength <= targetLength
+  ) {
+    const onlyChunk = pendingTerminalOutput[pendingTerminalOutputIndex];
+    pendingTerminalOutput = [];
+    pendingTerminalOutputIndex = 0;
+    pendingTerminalOutputBytes = 0;
+    return onlyChunk;
+  }
+
+  const bytes = new Uint8Array(targetLength);
+  let offset = 0;
+
+  while (offset < targetLength && pendingTerminalOutputIndex < pendingTerminalOutput.length) {
+    const chunk = pendingTerminalOutput[pendingTerminalOutputIndex];
+    const remaining = targetLength - offset;
+
+    if (chunk.byteLength <= remaining) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+      pendingTerminalOutputIndex += 1;
+      pendingTerminalOutputBytes -= chunk.byteLength;
+      continue;
+    }
+
+    bytes.set(chunk.subarray(0, remaining), offset);
+    pendingTerminalOutput[pendingTerminalOutputIndex] = chunk.subarray(remaining);
+    pendingTerminalOutputBytes -= remaining;
+    offset += remaining;
+  }
+
+  if (pendingTerminalOutputIndex > 32 && pendingTerminalOutputIndex * 2 > pendingTerminalOutput.length) {
+    pendingTerminalOutput = pendingTerminalOutput.slice(pendingTerminalOutputIndex);
+    pendingTerminalOutputIndex = 0;
+  }
+
+  return bytes;
 }
 
 function decodeBase64Bytes(value: string): Uint8Array {
@@ -1262,6 +1398,7 @@ async function setupBackendListeners(): Promise<void> {
     state.mode = "error";
     state.lastError = event.payload.message;
     clearPendingSerialText();
+    clearPendingTerminalOutput();
     terminal.writeln(`\x1b[31m${event.payload.message}\x1b[0m`);
     void invoke<void>("disconnect");
     renderApp();
@@ -1338,6 +1475,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 updateScale();
+startPerformanceProbe();
 renderApp();
 void setupBackendListeners();
 void refreshFonts();
