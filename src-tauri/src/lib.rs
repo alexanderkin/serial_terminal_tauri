@@ -939,7 +939,7 @@ fn normalize_device_id(device_id: &str) -> Result<String, String> {
 
 fn normalize_scrcpy_options(options: ScrcpyOptions) -> Result<ScrcpyOptions, String> {
     let video_codec = options.video_codec.trim().to_ascii_lowercase();
-    if !matches!(video_codec.as_str(), "h264" | "h265" | "av1") {
+    if !matches!(video_codec.as_str(), "h264" | "h265") {
         return Err(format!("不支持的视频编码: {}", options.video_codec));
     }
 

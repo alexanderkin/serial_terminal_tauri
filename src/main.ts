@@ -16,7 +16,7 @@ type PickerId =
   | "font"
   | "adbDevice"
   | "scrcpyCodec";
-type ScrcpyVideoCodec = "h264" | "h265" | "av1";
+type ScrcpyVideoCodec = "h264" | "h265";
 type TerminalContextMenuAction = "copy" | "paste" | "clear";
 type TerminalSessionKind = "serial" | "adbShell";
 type ResizeDirection =
@@ -1264,7 +1264,7 @@ function pickerOptions(id: PickerId): PickerOption[] {
   }
 
   if (id === "scrcpyCodec") {
-    return ["h265", "h264", "av1"].map((codec) => ({
+    return ["h265", "h264"].map((codec) => ({
       label: codec,
       value: codec,
     }));
@@ -2347,7 +2347,7 @@ function canToggleRemoteAdb(): boolean {
 }
 
 function normalizeScrcpyVideoCodec(value: unknown): ScrcpyVideoCodec {
-  return value === "h264" || value === "av1" ? value : "h265";
+  return value === "h264" ? value : "h265";
 }
 
 function normalizeScrcpyBitRate(value: unknown): string {
