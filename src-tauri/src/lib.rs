@@ -31,6 +31,11 @@ const SERIAL_EMIT_INTERVAL_MS: u64 = 2;
 const SERIAL_EMIT_BUFFER_LIMIT: usize = 4 * 1024;
 const SERIAL_WRITE_BUFFER_LIMIT: usize = 256;
 const SERIAL_PERF_WARN_MS: u128 = 25;
+const ADB_CONNECT_TIMEOUT_MS: u64 = 4_000;
+const ADB_COMMAND_TIMEOUT_MS: u64 = 3_000;
+const COMMAND_POLL_INTERVAL_MS: u64 = 25;
+const COMMAND_OUTPUT_DRAIN_TIMEOUT_MS: u64 = 250;
+const PROCESS_TERMINATE_TIMEOUT_MS: u64 = 500;
 
 #[derive(Default)]
 struct SerialManager {
@@ -262,7 +267,7 @@ fn report_perf(message: String) {
 #[tauri::command]
 fn adb_connect(address: String) -> Result<AdbCommandResult, String> {
     let address = normalize_adb_address(&address)?;
-    let message = run_adb_command(&["connect", &address])?;
+    let message = run_adb_command(&["connect", &address], ADB_CONNECT_TIMEOUT_MS)?;
 
     if is_adb_connect_failure(&message) {
         return Err(format!(
@@ -277,13 +282,13 @@ fn adb_connect(address: String) -> Result<AdbCommandResult, String> {
 #[tauri::command]
 fn adb_disconnect(address: String) -> Result<AdbCommandResult, String> {
     let address = normalize_adb_address(&address)?;
-    let message = run_adb_command(&["disconnect", &address])?;
+    let message = run_adb_command(&["disconnect", &address], ADB_COMMAND_TIMEOUT_MS)?;
     Ok(AdbCommandResult { address, message })
 }
 
 #[tauri::command]
 fn list_adb_state(manager: State<'_, AndroidManager>) -> Result<AndroidState, String> {
-    let output = run_adb_command(&["devices"])?;
+    let output = run_adb_command(&["devices"], ADB_COMMAND_TIMEOUT_MS)?;
     let devices = parse_adb_devices(&output);
     let scrcpy_devices = {
         let mut processes = manager
@@ -374,8 +379,10 @@ fn stop_scrcpy(manager: State<'_, AndroidManager>, device_id: String) -> Result<
     cleanup_scrcpy_locked(&mut processes);
 
     if let Some(mut child) = processes.remove(&device_id) {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child_with_timeout(
+            &mut child,
+            Duration::from_millis(PROCESS_TERMINATE_TIMEOUT_MS),
+        );
     }
 
     Ok(())
@@ -955,7 +962,7 @@ fn normalize_scrcpy_options(options: ScrcpyOptions) -> Result<ScrcpyOptions, Str
     })
 }
 
-fn run_adb_command(args: &[&str]) -> Result<String, String> {
+fn run_adb_command(args: &[&str], timeout_ms: u64) -> Result<String, String> {
     let adb_path = find_tool_path("adb")?;
     let mut command = Command::new(&adb_path);
     if let Some(adb_dir) = adb_path.parent() {
@@ -964,9 +971,13 @@ fn run_adb_command(args: &[&str]) -> Result<String, String> {
     command.args(args);
     hide_command_window(&mut command);
 
-    let output = command
-        .output()
-        .map_err(|error| format!("执行 adb 失败: {error} ({})", adb_path.to_string_lossy()))?;
+    let command_name = format!("adb {}", args.join(" "));
+    let output = command_output_with_timeout(
+        &mut command,
+        Duration::from_millis(timeout_ms),
+        &command_name,
+    )
+    .map_err(|error| format!("执行 adb 失败: {error} ({})", adb_path.to_string_lossy()))?;
     let message = command_output_text(&output);
 
     if !output.status.success() {
@@ -977,6 +988,109 @@ fn run_adb_command(args: &[&str]) -> Result<String, String> {
     }
 
     Ok(message)
+}
+
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    command_name: &str,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_child_with_timeout(
+                &mut child,
+                Duration::from_millis(PROCESS_TERMINATE_TIMEOUT_MS),
+            );
+            return Err(format!("创建 {command_name} 输出通道失败"));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_child_with_timeout(
+                &mut child,
+                Duration::from_millis(PROCESS_TERMINATE_TIMEOUT_MS),
+            );
+            return Err(format!("创建 {command_name} 错误输出通道失败"));
+        }
+    };
+    let stdout_rx = spawn_command_output_reader(stdout);
+    let stderr_rx = spawn_command_output_reader(stderr);
+    let started_at = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(Output {
+                    status,
+                    stdout: receive_command_output(stdout_rx),
+                    stderr: receive_command_output(stderr_rx),
+                });
+            }
+            Ok(None) if started_at.elapsed() >= timeout => {
+                terminate_child_with_timeout(
+                    &mut child,
+                    Duration::from_millis(PROCESS_TERMINATE_TIMEOUT_MS),
+                );
+                let stdout = receive_command_output(stdout_rx);
+                let stderr = receive_command_output(stderr_rx);
+                let partial =
+                    fallback_command_message(&command_output_text_from_bytes(&stdout, &stderr));
+                if partial == "没有输出" {
+                    return Err(format!(
+                        "{command_name} 超时（{}ms），已终止进程",
+                        timeout.as_millis()
+                    ));
+                }
+                return Err(format!(
+                    "{command_name} 超时（{}ms），已终止进程；输出: {partial}",
+                    timeout.as_millis()
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(COMMAND_POLL_INTERVAL_MS)),
+            Err(error) => {
+                terminate_child_with_timeout(
+                    &mut child,
+                    Duration::from_millis(PROCESS_TERMINATE_TIMEOUT_MS),
+                );
+                return Err(format!("{command_name} 状态检查失败: {error}"));
+            }
+        }
+    }
+}
+
+fn spawn_command_output_reader<R>(mut reader: R) -> mpsc::Receiver<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let _ = thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = reader.read_to_end(&mut output);
+        let _ = tx.send(output);
+    });
+    rx
+}
+
+fn receive_command_output(rx: mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    rx.recv_timeout(Duration::from_millis(COMMAND_OUTPUT_DRAIN_TIMEOUT_MS))
+        .unwrap_or_default()
+}
+
+fn terminate_child_with_timeout(child: &mut Child, timeout: Duration) {
+    let _ = child.kill();
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if started_at.elapsed() >= timeout => break,
+            Ok(None) => thread::sleep(Duration::from_millis(COMMAND_POLL_INTERVAL_MS)),
+        }
+    }
 }
 
 fn parse_adb_devices(output: &str) -> Vec<AdbDevice> {
@@ -1056,8 +1170,12 @@ fn hide_command_window(command: &mut Command) {
 fn hide_command_window(_command: &mut Command) {}
 
 fn command_output_text(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    command_output_text_from_bytes(&output.stdout, &output.stderr)
+}
+
+fn command_output_text_from_bytes(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
 
     match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => String::new(),
@@ -1091,8 +1209,7 @@ fn scrcpy_devices_locked(processes: &HashMap<String, Child>) -> Vec<String> {
 
 fn stop_all_scrcpy_locked(processes: &mut HashMap<String, Child>) {
     for child in processes.values_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child_with_timeout(child, Duration::from_millis(PROCESS_TERMINATE_TIMEOUT_MS));
     }
     processes.clear();
 }

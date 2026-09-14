@@ -259,6 +259,7 @@ let terminalContextMenu: TerminalContextMenuState | null = null;
 let pendingStatsUpdate = false;
 let lastPerfReportAt = 0;
 let sidebarScrollTop = 0;
+let adbRefreshInFlight = false;
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
@@ -339,11 +340,16 @@ function renderApp(): void {
                 <span title="${escapeAttribute(serialConnectionDetail)}">${escapeHtml(serialConnectionDetail)}</span>
               </span>
             </div>
-            <button id="connection-toggle" class="primary-button ${state.mode}" type="button" ${
+            <button
+              id="connection-toggle"
+              class="secondary-button full-button ${state.mode === "connected" ? "danger-button" : ""}"
+              type="button"
+              ${
               state.mode === "connecting" || (!state.config.port_name && state.mode !== "connected")
                 ? "disabled"
                 : ""
-            }>
+            }
+            >
               ${connectionButtonText()}
             </button>
             ${state.lastError ? `<div class="error-text">${escapeHtml(state.lastError)}</div>` : ""}
@@ -487,7 +493,7 @@ function renderAndroidSections(): string {
       </button>
       <button
         id="scrcpy-toggle"
-        class="primary-button ${scrcpyRunning ? "connected" : ""}"
+        class="secondary-button full-button ${scrcpyRunning ? "danger-button" : ""}"
         type="button"
         ${state.scrcpyBusy || !canToggleScrcpy() ? "disabled" : ""}
       >
@@ -1358,10 +1364,11 @@ async function refreshFonts(): Promise<void> {
 }
 
 async function refreshAdbState(shouldRender = true): Promise<void> {
-  if (state.adbBusy) {
+  if (state.adbBusy || adbRefreshInFlight) {
     return;
   }
 
+  adbRefreshInFlight = true;
   try {
     const androidState = await invoke<AndroidStatePayload>("list_adb_state");
     applyAndroidState(androidState);
@@ -1370,6 +1377,8 @@ async function refreshAdbState(shouldRender = true): Promise<void> {
     state.androidError = toMessage(error);
     state.adbDevices = [];
     applyScrcpyDevices([]);
+  } finally {
+    adbRefreshInFlight = false;
   }
 
   if (shouldRender && !isTextInputActive()) {
@@ -1719,7 +1728,7 @@ function updateAndroidControls(): void {
     const running = isScrcpyRunning(state.selectedAdbDevice);
     scrcpyToggle.disabled = state.scrcpyBusy || !canToggleScrcpy();
     scrcpyToggle.textContent = scrcpyButtonText();
-    scrcpyToggle.classList.toggle("connected", running);
+    scrcpyToggle.classList.toggle("danger-button", running);
   }
 
   const adbShellOpen = document.querySelector<HTMLButtonElement>("#adb-shell-open");
