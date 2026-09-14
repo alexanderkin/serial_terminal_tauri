@@ -184,6 +184,7 @@ const fallbackFontFamilies = [
 const storageKey = "serial-terminal-settings-v1";
 const defaultRemoteAdbAddress = "192.168.30.1:5555";
 const defaultScrcpyBitRate = "8M";
+const defaultTerminalFontSize = 20;
 const adbStateRefreshIntervalMs = 5000;
 const scrcpyStateRefreshIntervalMs = 800;
 const serialTerminalId = "serial";
@@ -213,7 +214,7 @@ const state: AppState = {
   fontFamily: savedSettings.fontFamily ?? fallbackFontFamilies[0],
   activePicker: null,
   pickerPosition: null,
-  fontSize: savedSettings.fontSize ?? 18,
+  fontSize: savedSettings.fontSize ?? defaultTerminalFontSize,
   lineSpacing: savedSettings.lineSpacing ?? 1,
   remoteAdbHistory: savedSettings.remoteAdbHistory ?? [],
   remoteAdbInput: defaultRemoteAdbAddress,
@@ -2211,7 +2212,7 @@ function normalizeSavedSettings(value: SavedSettings): SavedSettings {
     fontSize:
       typeof value.fontSize === "number" && Number.isFinite(value.fontSize)
         ? Math.min(34, Math.max(12, value.fontSize))
-        : 18,
+        : defaultTerminalFontSize,
     lineSpacing:
       typeof value.lineSpacing === "number" && Number.isFinite(value.lineSpacing)
         ? Math.min(1.6, Math.max(0.9, value.lineSpacing))
