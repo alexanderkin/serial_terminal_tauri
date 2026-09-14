@@ -7,7 +7,17 @@ import "@xterm/xterm/css/xterm.css";
 
 type ConnectionMode = "disconnected" | "connecting" | "connected" | "error";
 type Parity = "none" | "even" | "odd";
-type PickerId = "port" | "baud" | "font";
+type PickerId =
+  | "port"
+  | "baud"
+  | "dataBits"
+  | "parity"
+  | "stopBits"
+  | "font"
+  | "remoteAdb"
+  | "adbDevice"
+  | "scrcpyCodec";
+type ScrcpyVideoCodec = "h264" | "h265" | "av1";
 type TerminalContextMenuAction = "copy" | "paste" | "clear";
 type ResizeDirection =
   | "North"
@@ -51,6 +61,27 @@ interface SerialErrorPayload {
   message: string;
 }
 
+interface AdbCommandResult {
+  address: string;
+  message: string;
+}
+
+interface AdbDevice {
+  id: string;
+  state: string;
+  is_remote: boolean;
+}
+
+interface AndroidStatePayload {
+  devices: AdbDevice[];
+  scrcpy_devices: string[];
+}
+
+interface ScrcpyOptions {
+  video_codec: ScrcpyVideoCodec;
+  video_bit_rate: string;
+}
+
 interface AppState {
   ports: string[];
   availableFonts: string[];
@@ -64,6 +95,18 @@ interface AppState {
   pickerPosition: DropdownPosition | null;
   fontSize: number;
   lineSpacing: number;
+  remoteAdbHistory: string[];
+  remoteAdbInput: string;
+  selectedRemoteAdb: string;
+  adbDevices: AdbDevice[];
+  selectedAdbDevice: string;
+  scrcpyDevices: string[];
+  scrcpyOptions: ScrcpyOptions;
+  scrcpySessionOptions: Record<string, ScrcpyOptions>;
+  adbBusy: boolean;
+  scrcpyBusy: boolean;
+  androidMessage: string;
+  androidError: string;
 }
 
 interface SavedSettings {
@@ -71,16 +114,17 @@ interface SavedSettings {
   fontFamily?: string;
   fontSize?: number;
   lineSpacing?: number;
-}
-
-interface SegmentOption {
-  label: string;
-  value: string;
+  remoteAdbHistory?: string[];
+  selectedRemoteAdb?: string;
+  selectedAdbDevice?: string;
+  scrcpyOptions?: Partial<ScrcpyOptions>;
 }
 
 interface PickerOption {
   label: string;
   value: string;
+  detail?: string;
+  status?: string;
 }
 
 const baudRates = [
@@ -100,6 +144,9 @@ const fallbackFontFamilies = [
 ];
 
 const storageKey = "serial-terminal-settings-v1";
+const defaultScrcpyBitRate = "8M";
+const adbStateRefreshIntervalMs = 5000;
+const scrcpyStateRefreshIntervalMs = 800;
 const serialWriteChunkSize = 64;
 const serialWriteMaxChunksPerPump = 4;
 const serialWriteMaxInFlight = 8;
@@ -128,6 +175,21 @@ const state: AppState = {
   pickerPosition: null,
   fontSize: savedSettings.fontSize ?? 18,
   lineSpacing: savedSettings.lineSpacing ?? 1,
+  remoteAdbHistory: savedSettings.remoteAdbHistory ?? [],
+  remoteAdbInput: savedSettings.selectedRemoteAdb ?? savedSettings.remoteAdbHistory?.[0] ?? "",
+  selectedRemoteAdb: savedSettings.selectedRemoteAdb ?? savedSettings.remoteAdbHistory?.[0] ?? "",
+  adbDevices: [],
+  selectedAdbDevice: savedSettings.selectedAdbDevice ?? "",
+  scrcpyDevices: [],
+  scrcpyOptions: {
+    video_codec: savedSettings.scrcpyOptions?.video_codec ?? "h265",
+    video_bit_rate: savedSettings.scrcpyOptions?.video_bit_rate ?? defaultScrcpyBitRate,
+  },
+  scrcpySessionOptions: {},
+  adbBusy: false,
+  scrcpyBusy: false,
+  androidMessage: "",
+  androidError: "",
 };
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -202,9 +264,12 @@ let terminalOutputWriting = false;
 let terminalContextMenu: TerminalContextMenuState | null = null;
 let pendingStatsUpdate = false;
 let lastPerfReportAt = 0;
+let sidebarScrollTop = 0;
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
+  const serialConnectionDetail = connectionDetailText();
+  captureSidebarScroll();
 
   app.innerHTML = `
     <div class="app-shell">
@@ -264,38 +329,31 @@ function renderApp(): void {
                 <button id="refresh-ports" class="secondary-button" type="button" ${locked ? "disabled" : ""}>刷新</button>
               </div>
             </label>
-            <label class="field">
-              <span>波特率</span>
-              ${renderPicker("baud", pickerLabel("baud"), locked)}
-            </label>
-            <div class="field">
-              <span>数据位</span>
-              ${renderSegment("data_bits", [
-                { label: "5", value: "5" },
-                { label: "6", value: "6" },
-                { label: "7", value: "7" },
-                { label: "8", value: "8" },
-              ])}
+            <div class="serial-profile-row">
+              <label class="field compact-field">
+                <span>波特率</span>
+                ${renderPicker("baud", pickerLabel("baud"), locked)}
+              </label>
+              <label class="field compact-field">
+                <span>数据位</span>
+                ${renderPicker("dataBits", pickerLabel("dataBits"), locked)}
+              </label>
+              <label class="field compact-field">
+                <span>校验位</span>
+                ${renderPicker("parity", pickerLabel("parity"), locked)}
+              </label>
+              <label class="field compact-field">
+                <span>停止位</span>
+                ${renderPicker("stopBits", pickerLabel("stopBits"), locked)}
+              </label>
             </div>
-            <div class="field">
-              <span>校验位</span>
-              ${renderSegment("parity", [
-                { label: "无", value: "none" },
-                { label: "偶", value: "even" },
-                { label: "奇", value: "odd" },
-              ])}
+            <div class="section-title subsection-title section-title-row">
+              <span>连接</span>
+              <span class="section-status">
+                <span class="small-dot ${statusTone()}"></span>
+                <span title="${escapeAttribute(serialConnectionDetail)}">${escapeHtml(serialConnectionDetail)}</span>
+              </span>
             </div>
-            <div class="field">
-              <span>停止位</span>
-              ${renderSegment("stop_bits", [
-                { label: "1", value: "1" },
-                { label: "2", value: "2" },
-              ])}
-            </div>
-          </section>
-
-          <section class="settings-section">
-            <div class="section-title">连接</div>
             <button id="connection-toggle" class="primary-button ${state.mode}" type="button" ${
               state.mode === "connecting" || (!state.config.port_name && state.mode !== "connected")
                 ? "disabled"
@@ -303,12 +361,10 @@ function renderApp(): void {
             }>
               ${connectionButtonText()}
             </button>
-            <div class="connection-line">
-              <span class="small-dot ${statusTone()}"></span>
-              <span>${connectionDetailText()}</span>
-            </div>
             ${state.lastError ? `<div class="error-text">${escapeHtml(state.lastError)}</div>` : ""}
           </section>
+
+          ${renderAndroidSections()}
 
           <section class="settings-section">
             <div class="section-title">终端显示</div>
@@ -345,6 +401,127 @@ function renderApp(): void {
   bindChromeEvents();
   attachTerminal();
   updateStats();
+  restoreSidebarScroll();
+}
+
+function captureSidebarScroll(): void {
+  const sidebar = document.querySelector<HTMLElement>(".sidebar");
+  if (sidebar) {
+    sidebarScrollTop = sidebar.scrollTop;
+  }
+}
+
+function restoreSidebarScroll(): void {
+  const sidebar = document.querySelector<HTMLElement>(".sidebar");
+  if (sidebar) {
+    sidebar.scrollTop = sidebarScrollTop;
+  }
+}
+
+function renderAndroidSections(): string {
+  const remoteAddress = currentRemoteAdbAddress();
+  const remoteStatus = remoteAdbStatus(remoteAddress);
+  const selectedDeviceStatus = adbDeviceState(state.selectedAdbDevice);
+  const scrcpyRunning = isScrcpyRunning(state.selectedAdbDevice);
+  const scrcpyOptions = selectedScrcpyOptions();
+  const parametersLocked = scrcpyParametersLocked();
+  const remoteDetail = remoteAdbDetailText(remoteAddress);
+  const scrcpyDetail = scrcpyDetailText();
+
+  return `
+    <section class="settings-section">
+      <div class="section-title section-title-row">
+        <span>远程 ADB</span>
+        <span class="section-status">
+          <span id="remote-adb-status-dot" class="small-dot ${adbStatusTone(remoteStatus)}"></span>
+          <span id="remote-adb-status-text" title="${escapeAttribute(remoteDetail)}">${escapeHtml(remoteDetail)}</span>
+        </span>
+      </div>
+      <label class="field">
+        <span>IP 地址</span>
+        <input
+          id="remote-adb-address"
+          class="text-input"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="192.168.1.20:5555"
+          value="${escapeAttribute(state.remoteAdbInput)}"
+          ${state.adbBusy ? "disabled" : ""}
+        />
+      </label>
+      <label class="field">
+        <span>历史设备</span>
+        <div class="field-row">
+          ${renderPicker("remoteAdb", pickerLabel("remoteAdb"), state.adbBusy || state.remoteAdbHistory.length === 0)}
+          <button id="refresh-adb" class="secondary-button" type="button" ${state.adbBusy ? "disabled" : ""}>
+            刷新
+          </button>
+        </div>
+      </label>
+      <button
+        id="adb-toggle"
+        class="secondary-button full-button ${remoteStatus === "device" ? "danger-button" : ""}"
+        type="button"
+        ${state.adbBusy || !remoteAddress ? "disabled" : ""}
+      >
+        ${remoteAdbButtonText()}
+      </button>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-title section-title-row">
+        <span>SCRCPY</span>
+        <span class="section-status">
+          <span id="adb-device-status-dot" class="small-dot ${adbStatusTone(selectedDeviceStatus)}"></span>
+          <span id="adb-device-status-text" title="${escapeAttribute(scrcpyDetail)}">${escapeHtml(scrcpyDetail)}</span>
+        </span>
+      </div>
+      <label class="field">
+        <span>ADB 设备</span>
+        <div class="field-row">
+          ${renderPicker("adbDevice", pickerLabel("adbDevice"), state.adbBusy || state.adbDevices.length === 0)}
+          <button
+            id="refresh-scrcpy-devices"
+            class="secondary-button"
+            type="button"
+            ${state.adbBusy || state.scrcpyBusy ? "disabled" : ""}
+          >
+            刷新
+          </button>
+        </div>
+      </label>
+      <div class="scrcpy-options-row">
+        <label class="field compact-field">
+          <span>视频编码</span>
+          ${renderPicker("scrcpyCodec", pickerLabel("scrcpyCodec"), parametersLocked)}
+        </label>
+        <label class="field compact-field">
+          <span>视频码率</span>
+          <input
+            id="scrcpy-bit-rate"
+            class="text-input"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="${defaultScrcpyBitRate}"
+            value="${escapeAttribute(scrcpyOptions.video_bit_rate)}"
+            ${parametersLocked ? "disabled" : ""}
+          />
+        </label>
+      </div>
+      <button
+        id="scrcpy-toggle"
+        class="primary-button ${scrcpyRunning ? "connected" : ""}"
+        type="button"
+        ${state.scrcpyBusy || !canToggleScrcpy() ? "disabled" : ""}
+      >
+        ${scrcpyButtonText()}
+      </button>
+      ${state.androidMessage ? `<div class="helper-text">${escapeHtml(state.androidMessage)}</div>` : ""}
+      ${state.androidError ? `<div class="error-text">${escapeHtml(state.androidError)}</div>` : ""}
+    </section>
+  `;
 }
 
 function attachTerminal(): void {
@@ -414,17 +591,8 @@ function bindChromeEvents(): void {
     });
   });
 
-  document.querySelectorAll<HTMLButtonElement>("[data-setting]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const setting = button.dataset.setting;
-      const value = button.dataset.value;
-      if (setting && value) {
-        applySerialSetting(setting, value);
-      }
-    });
-  });
-
   bindPickerEvents();
+  bindAndroidEvents();
 
   const fontSize = document.querySelector<HTMLInputElement>("#font-size");
   fontSize?.addEventListener("input", () => {
@@ -440,6 +608,53 @@ function bindChromeEvents(): void {
     updateOutput("#line-spacing-output", state.lineSpacing.toFixed(2));
     saveSettings();
     applyTerminalOptions();
+  });
+}
+
+function bindAndroidEvents(): void {
+  const remoteAdbAddress = document.querySelector<HTMLInputElement>("#remote-adb-address");
+  remoteAdbAddress?.addEventListener("input", () => {
+    state.remoteAdbInput = remoteAdbAddress.value;
+    syncRemoteSelectionFromInput();
+    updateAndroidControls();
+  });
+  remoteAdbAddress?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void toggleRemoteAdb();
+    }
+  });
+
+  document.querySelector("#adb-toggle")?.addEventListener("click", () => {
+    void toggleRemoteAdb();
+  });
+
+  document.querySelector("#refresh-adb")?.addEventListener("click", () => {
+    void refreshAdbState();
+  });
+
+  document.querySelector("#refresh-scrcpy-devices")?.addEventListener("click", () => {
+    void refreshAdbState();
+  });
+
+  const scrcpyBitRate = document.querySelector<HTMLInputElement>("#scrcpy-bit-rate");
+  scrcpyBitRate?.addEventListener("input", () => {
+    if (scrcpyParametersLocked()) {
+      scrcpyBitRate.value = selectedScrcpyOptions().video_bit_rate;
+      return;
+    }
+    state.scrcpyOptions.video_bit_rate = scrcpyBitRate.value;
+    saveSettings();
+  });
+  scrcpyBitRate?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void toggleScrcpy();
+    }
+  });
+
+  document.querySelector("#scrcpy-toggle")?.addEventListener("click", () => {
+    void toggleScrcpy();
   });
 }
 
@@ -611,33 +826,10 @@ async function updateWindowMaximizeIcon(): Promise<void> {
   }
 }
 
-function renderSegment(
-  setting: keyof Pick<SerialConfig, "data_bits" | "parity" | "stop_bits">,
-  options: SegmentOption[],
-): string {
-  const currentValue = String(state.config[setting]);
-  const locked = state.mode === "connected" || state.mode === "connecting";
-
-  return `
-    <div class="segmented">
-      ${options
-        .map(
-          (option) =>
-            `<button type="button" data-setting="${setting}" data-value="${
-              option.value
-            }" class="${option.value === currentValue ? "active" : ""}" ${
-              locked ? "disabled" : ""
-            }>${escapeHtml(option.label)}</button>`,
-        )
-        .join("")}
-    </div>
-  `;
-}
-
 function renderPicker(id: PickerId, label: string, disabled: boolean): string {
   return `
     <div class="picker-anchor">
-      <button class="picker-button" data-picker-id="${id}" type="button" aria-haspopup="listbox" aria-expanded="${
+      <button class="picker-button" data-picker-id="${id}" type="button" title="${escapeAttribute(label)}" aria-haspopup="listbox" aria-expanded="${
         state.activePicker === id ? "true" : "false"
       }" ${disabled ? "disabled" : ""}>
         <span>${escapeHtml(label)}</span>
@@ -673,17 +865,23 @@ function renderPickerOptions(): string {
   }
 
   return options
-    .map(
-      (option) =>
-        `<button type="button" class="picker-option${
+    .map((option) => {
+      const title = pickerOptionTitle(option);
+      return `<button type="button" class="picker-option${
           isPickerOptionActive(option) ? " active" : ""
-        }" data-picker-value="${escapeAttribute(option.value)}" role="option" aria-selected="${
+        }" data-picker-value="${escapeAttribute(option.value)}" title="${escapeAttribute(title)}" role="option" aria-selected="${
           isPickerOptionActive(option) ? "true" : "false"
         }">
-          <span>${escapeHtml(option.label)}</span>
-        </button>`,
-    )
+          ${option.status ? `<span class="picker-status-dot ${adbStatusTone(option.status)}"></span>` : ""}
+          <span class="picker-option-label">${escapeHtml(option.label)}</span>
+          ${option.detail ? `<span class="picker-option-detail">${escapeHtml(option.detail)}</span>` : ""}
+        </button>`;
+    })
     .join("");
+}
+
+function pickerOptionTitle(option: PickerOption): string {
+  return option.detail ? `${option.label} · ${option.detail}` : option.label;
 }
 
 function bindPickerEvents(): void {
@@ -732,10 +930,43 @@ function selectPickerOption(id: PickerId, value: string): void {
     state.config.port_name = value;
   } else if (id === "baud") {
     state.config.baud_rate = Number(value);
-  } else {
+  } else if (id === "dataBits") {
+    if (serialSettingsLocked()) {
+      closePicker();
+      renderApp();
+      return;
+    }
+    state.config.data_bits = Number(value);
+  } else if (id === "parity") {
+    if (serialSettingsLocked()) {
+      closePicker();
+      renderApp();
+      return;
+    }
+    state.config.parity = value as Parity;
+  } else if (id === "stopBits") {
+    if (serialSettingsLocked()) {
+      closePicker();
+      renderApp();
+      return;
+    }
+    state.config.stop_bits = Number(value);
+  } else if (id === "font") {
     state.fontFamily = value;
     state.availableFonts = mergeFonts([value, ...state.availableFonts]);
     applyTerminalOptions();
+  } else if (id === "remoteAdb") {
+    state.selectedRemoteAdb = value;
+    state.remoteAdbInput = value;
+  } else if (id === "adbDevice") {
+    state.selectedAdbDevice = value;
+  } else if (id === "scrcpyCodec") {
+    if (scrcpyParametersLocked()) {
+      closePicker();
+      renderApp();
+      return;
+    }
+    state.scrcpyOptions.video_codec = value as ScrcpyVideoCodec;
   }
 
   closePicker();
@@ -750,6 +981,24 @@ function pickerLabel(id: PickerId): string {
   if (id === "baud") {
     return String(state.config.baud_rate);
   }
+  if (id === "dataBits") {
+    return String(state.config.data_bits);
+  }
+  if (id === "parity") {
+    return parityText(state.config.parity);
+  }
+  if (id === "stopBits") {
+    return String(state.config.stop_bits);
+  }
+  if (id === "remoteAdb") {
+    return remoteAdbPickerLabel();
+  }
+  if (id === "adbDevice") {
+    return adbDevicePickerLabel();
+  }
+  if (id === "scrcpyCodec") {
+    return selectedScrcpyOptions().video_codec;
+  }
   return state.fontFamily;
 }
 
@@ -760,6 +1009,56 @@ function pickerOptions(id: PickerId): PickerOption[] {
 
   if (id === "baud") {
     return baudRates.map((rate) => ({ label: String(rate), value: String(rate) }));
+  }
+
+  if (id === "dataBits") {
+    return [5, 6, 7, 8].map((value) => ({
+      label: String(value),
+      value: String(value),
+    }));
+  }
+
+  if (id === "parity") {
+    return [
+      { label: "无", value: "none" },
+      { label: "偶", value: "even" },
+      { label: "奇", value: "odd" },
+    ];
+  }
+
+  if (id === "stopBits") {
+    return [1, 2].map((value) => ({
+      label: String(value),
+      value: String(value),
+    }));
+  }
+
+  if (id === "remoteAdb") {
+    return state.remoteAdbHistory.map((address) => {
+      const status = remoteAdbStatus(address);
+      return {
+        label: address,
+        value: address,
+        status,
+        detail: adbStateText(status),
+      };
+    });
+  }
+
+  if (id === "adbDevice") {
+    return state.adbDevices.map((device) => ({
+      label: device.id,
+      value: device.id,
+      status: device.state,
+      detail: adbDeviceDetail(device),
+    }));
+  }
+
+  if (id === "scrcpyCodec") {
+    return ["h265", "h264", "av1"].map((codec) => ({
+      label: codec,
+      value: codec,
+    }));
   }
 
   return mergeFonts([state.fontFamily, ...state.availableFonts]).map((font) => ({
@@ -775,6 +1074,24 @@ function isPickerOptionActive(option: PickerOption): boolean {
   if (state.activePicker === "baud") {
     return Number(option.value) === state.config.baud_rate;
   }
+  if (state.activePicker === "dataBits") {
+    return Number(option.value) === state.config.data_bits;
+  }
+  if (state.activePicker === "parity") {
+    return option.value === state.config.parity;
+  }
+  if (state.activePicker === "stopBits") {
+    return Number(option.value) === state.config.stop_bits;
+  }
+  if (state.activePicker === "remoteAdb") {
+    return option.value === state.selectedRemoteAdb;
+  }
+  if (state.activePicker === "adbDevice") {
+    return option.value === state.selectedAdbDevice;
+  }
+  if (state.activePicker === "scrcpyCodec") {
+    return option.value === selectedScrcpyOptions().video_codec;
+  }
   return option.value === state.fontFamily;
 }
 
@@ -786,10 +1103,7 @@ function calculatePickerPosition(button: HTMLElement, optionCount: number): Drop
   const rowHeight = 34 * scale;
   const menuPadding = 8 * scale;
   const desiredHeight = Math.min(Math.max(optionCount, 1), 8) * rowHeight + menuPadding;
-  const width = Math.min(
-    Math.max(rect.width, Math.min(260, window.innerWidth - margin * 2)),
-    window.innerWidth - margin * 2,
-  );
+  const width = Math.min(rect.width, window.innerWidth - margin * 2);
   const left = clamp(rect.left, margin, window.innerWidth - width - margin);
   const availableDown = window.innerHeight - rect.bottom - gap - margin;
   const availableUp = rect.top - gap - margin;
@@ -806,23 +1120,6 @@ function calculatePickerPosition(button: HTMLElement, optionCount: number): Drop
     maxHeight,
     placement: openUp ? "up" : "down",
   };
-}
-
-function applySerialSetting(setting: string, value: string): void {
-  if (state.mode === "connected" || state.mode === "connecting") {
-    return;
-  }
-
-  if (setting === "data_bits") {
-    state.config.data_bits = Number(value);
-  } else if (setting === "parity") {
-    state.config.parity = value as Parity;
-  } else if (setting === "stop_bits") {
-    state.config.stop_bits = Number(value);
-  }
-
-  saveSettings();
-  renderApp();
 }
 
 function applyTerminalOptions(): void {
@@ -858,6 +1155,260 @@ async function refreshFonts(): Promise<void> {
   }
 
   renderApp();
+}
+
+async function refreshAdbState(shouldRender = true): Promise<void> {
+  if (state.adbBusy) {
+    return;
+  }
+
+  try {
+    const androidState = await invoke<AndroidStatePayload>("list_adb_state");
+    applyAndroidState(androidState);
+    state.androidError = "";
+  } catch (error) {
+    state.androidError = toMessage(error);
+    state.adbDevices = [];
+    applyScrcpyDevices([]);
+  }
+
+  if (shouldRender && !isTextInputActive()) {
+    renderApp();
+  } else {
+    updateAndroidControls();
+  }
+}
+
+async function refreshScrcpyState(shouldRender = false): Promise<void> {
+  if (state.scrcpyBusy) {
+    return;
+  }
+
+  const selectedDevice = state.selectedAdbDevice;
+  const selectedWasRunning = isScrcpyRunning(selectedDevice);
+
+  try {
+    const scrcpyDevices = await invoke<string[]>("list_scrcpy_devices");
+    const changed = applyScrcpyDevices(scrcpyDevices);
+    if (changed && selectedDevice && selectedWasRunning && !isScrcpyRunning(selectedDevice)) {
+      state.androidMessage = `scrcpy 已关闭: ${selectedDevice}`;
+    }
+
+    if ((shouldRender || changed) && !isTextInputActive()) {
+      renderApp();
+    } else {
+      updateAndroidControls();
+    }
+  } catch (error) {
+    state.androidError = toMessage(error);
+    if (shouldRender && !isTextInputActive()) {
+      renderApp();
+    } else {
+      updateAndroidControls();
+    }
+  }
+}
+
+function applyAndroidState(androidState: AndroidStatePayload): void {
+  state.adbDevices = androidState.devices;
+  applyScrcpyDevices(androidState.scrcpy_devices);
+
+  const selectedDeviceExists = state.adbDevices.some(
+    (device) => device.id === state.selectedAdbDevice,
+  );
+  if (!selectedDeviceExists) {
+    const firstOnlineDevice = state.adbDevices.find((device) => device.state === "device");
+    state.selectedAdbDevice = firstOnlineDevice?.id ?? state.adbDevices[0]?.id ?? "";
+  }
+
+  if (!state.selectedRemoteAdb && state.remoteAdbHistory.length > 0) {
+    state.selectedRemoteAdb = state.remoteAdbHistory[0];
+    state.remoteAdbInput = state.selectedRemoteAdb;
+  }
+
+  saveSettings();
+}
+
+function applyScrcpyDevices(deviceIds: string[]): boolean {
+  const previous = state.scrcpyDevices.join("\0");
+  state.scrcpyDevices = [...deviceIds].sort();
+  cleanupScrcpySessionOptions();
+  return previous !== state.scrcpyDevices.join("\0");
+}
+
+async function toggleRemoteAdb(): Promise<void> {
+  const address = currentRemoteAdbAddress();
+  if (!address) {
+    state.androidError = "请输入远程 ADB 地址";
+    renderApp();
+    return;
+  }
+
+  const connected = remoteAdbStatus(address) === "device";
+  state.adbBusy = true;
+  state.androidError = "";
+  state.androidMessage = "";
+  renderApp();
+
+  try {
+    const result = connected
+      ? await invoke<AdbCommandResult>("adb_disconnect", { address })
+      : await invoke<AdbCommandResult>("adb_connect", { address });
+
+    addRemoteAdbHistory(result.address);
+    state.selectedRemoteAdb = result.address;
+    state.remoteAdbInput = result.address;
+    state.androidMessage =
+      result.message || `${connected ? "已断开" : "已连接"} ${result.address}`;
+  } catch (error) {
+    state.androidError = toMessage(error);
+  } finally {
+    state.adbBusy = false;
+  }
+
+  await refreshAdbState(false);
+  renderApp();
+}
+
+async function toggleScrcpy(): Promise<void> {
+  const deviceId = state.selectedAdbDevice;
+  if (!deviceId) {
+    state.androidError = "请选择一个 ADB 设备";
+    renderApp();
+    return;
+  }
+
+  if (!canToggleScrcpy()) {
+    state.androidError = "当前 ADB 设备不可用";
+    renderApp();
+    return;
+  }
+
+  const running = isScrcpyRunning(deviceId);
+  state.scrcpyBusy = true;
+  state.androidError = "";
+  state.androidMessage = "";
+  renderApp();
+
+  try {
+    if (running) {
+      await invoke<void>("stop_scrcpy", { deviceId });
+      delete state.scrcpySessionOptions[deviceId];
+      state.androidMessage = `已关闭 scrcpy: ${deviceId}`;
+    } else {
+      const options = copyScrcpyOptions(state.scrcpyOptions);
+      await invoke<void>("start_scrcpy", {
+        deviceId,
+        options,
+      });
+      state.scrcpySessionOptions[deviceId] = options;
+      state.androidMessage = `已打开 scrcpy: ${deviceId}`;
+    }
+  } catch (error) {
+    state.androidError = toMessage(error);
+  } finally {
+    state.scrcpyBusy = false;
+  }
+
+  await refreshAdbState(false);
+  renderApp();
+}
+
+function addRemoteAdbHistory(address: string): void {
+  const normalized = normalizeRemoteAdbAddress(address);
+  if (!normalized) {
+    return;
+  }
+
+  state.remoteAdbHistory = [
+    normalized,
+    ...state.remoteAdbHistory.filter((entry) => entry !== normalized),
+  ];
+  saveSettings();
+}
+
+function syncRemoteSelectionFromInput(): void {
+  const normalized = normalizeRemoteAdbAddress(state.remoteAdbInput);
+  state.selectedRemoteAdb = state.remoteAdbHistory.includes(normalized) ? normalized : "";
+}
+
+function updateAndroidControls(): void {
+  const remoteAddress = currentRemoteAdbAddress();
+  const remoteStatus = remoteAdbStatus(remoteAddress);
+  const parametersLocked = scrcpyParametersLocked();
+  const scrcpyOptions = selectedScrcpyOptions();
+  updatePickerButtonState(
+    "remoteAdb",
+    pickerLabel("remoteAdb"),
+    state.adbBusy || state.remoteAdbHistory.length === 0,
+  );
+  updatePickerButtonState(
+    "adbDevice",
+    pickerLabel("adbDevice"),
+    state.adbBusy || state.adbDevices.length === 0,
+  );
+  updatePickerButtonState("scrcpyCodec", pickerLabel("scrcpyCodec"), parametersLocked);
+
+  const adbToggle = document.querySelector<HTMLButtonElement>("#adb-toggle");
+  if (adbToggle) {
+    adbToggle.disabled = state.adbBusy || !remoteAddress;
+    adbToggle.textContent = remoteAdbButtonText();
+    adbToggle.classList.toggle("danger-button", remoteStatus === "device");
+  }
+
+  const refreshAdb = document.querySelector<HTMLButtonElement>("#refresh-adb");
+  if (refreshAdb) {
+    refreshAdb.disabled = state.adbBusy;
+  }
+
+  const remoteStatusDot = document.querySelector("#remote-adb-status-dot");
+  if (remoteStatusDot) {
+    remoteStatusDot.className = `small-dot ${adbStatusTone(remoteStatus)}`;
+  }
+  updateTextWithTitle("#remote-adb-status-text", remoteAdbDetailText(remoteAddress));
+
+  const refreshScrcpyDevices =
+    document.querySelector<HTMLButtonElement>("#refresh-scrcpy-devices");
+  if (refreshScrcpyDevices) {
+    refreshScrcpyDevices.disabled = state.adbBusy || state.scrcpyBusy;
+  }
+
+  const scrcpyBitRate = document.querySelector<HTMLInputElement>("#scrcpy-bit-rate");
+  if (scrcpyBitRate) {
+    scrcpyBitRate.disabled = parametersLocked;
+    if (parametersLocked || document.activeElement !== scrcpyBitRate) {
+      scrcpyBitRate.value = scrcpyOptions.video_bit_rate;
+    }
+  }
+
+  const scrcpyToggle = document.querySelector<HTMLButtonElement>("#scrcpy-toggle");
+  if (scrcpyToggle) {
+    const running = isScrcpyRunning(state.selectedAdbDevice);
+    scrcpyToggle.disabled = state.scrcpyBusy || !canToggleScrcpy();
+    scrcpyToggle.textContent = scrcpyButtonText();
+    scrcpyToggle.classList.toggle("connected", running);
+  }
+
+  const selectedDeviceStatus = adbDeviceState(state.selectedAdbDevice);
+  const deviceStatusDot = document.querySelector("#adb-device-status-dot");
+  if (deviceStatusDot) {
+    deviceStatusDot.className = `small-dot ${adbStatusTone(selectedDeviceStatus)}`;
+  }
+  updateTextWithTitle("#adb-device-status-text", scrcpyDetailText());
+}
+
+function updatePickerButtonState(id: PickerId, label: string, disabled: boolean): void {
+  const button = document.querySelector<HTMLButtonElement>(`[data-picker-id="${id}"]`);
+  if (!button) {
+    return;
+  }
+
+  button.disabled = disabled;
+  button.title = label;
+  const labelElement = button.querySelector("span:first-child");
+  if (labelElement) {
+    labelElement.textContent = label;
+  }
 }
 
 async function toggleConnection(): Promise<void> {
@@ -1219,6 +1770,14 @@ function updateText(selector: string, text: string): void {
   }
 }
 
+function updateTextWithTitle(selector: string, text: string): void {
+  const element = document.querySelector<HTMLElement>(selector);
+  if (element) {
+    element.textContent = text;
+    element.title = text;
+  }
+}
+
 function terminalFontFamily(): string {
   return `${state.fontFamily}, "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace`;
 }
@@ -1266,6 +1825,13 @@ function readSavedSettings(): SavedSettings {
 function normalizeSavedSettings(value: SavedSettings): SavedSettings {
   const config = value.config ?? {};
   const parity = config.parity === "even" || config.parity === "odd" ? config.parity : "none";
+  const remoteAdbHistory = normalizeRemoteAdbHistory(value.remoteAdbHistory);
+  const selectedRemoteAdb = normalizeRemoteAdbAddress(
+    typeof value.selectedRemoteAdb === "string" ? value.selectedRemoteAdb : "",
+  );
+  const selectedAdbDevice =
+    typeof value.selectedAdbDevice === "string" ? value.selectedAdbDevice.trim() : "";
+  const scrcpyOptions = value.scrcpyOptions ?? {};
 
   return {
     config: {
@@ -1290,6 +1856,15 @@ function normalizeSavedSettings(value: SavedSettings): SavedSettings {
       typeof value.lineSpacing === "number" && Number.isFinite(value.lineSpacing)
         ? Math.min(1.6, Math.max(0.9, value.lineSpacing))
         : 1,
+    remoteAdbHistory,
+    selectedRemoteAdb: remoteAdbHistory.includes(selectedRemoteAdb)
+      ? selectedRemoteAdb
+      : remoteAdbHistory[0] ?? "",
+    selectedAdbDevice,
+    scrcpyOptions: {
+      video_codec: normalizeScrcpyVideoCodec(scrcpyOptions.video_codec),
+      video_bit_rate: normalizeScrcpyBitRate(scrcpyOptions.video_bit_rate),
+    },
   };
 }
 
@@ -1299,8 +1874,210 @@ function saveSettings(): void {
     fontFamily: state.fontFamily,
     fontSize: state.fontSize,
     lineSpacing: state.lineSpacing,
+    remoteAdbHistory: state.remoteAdbHistory,
+    selectedRemoteAdb: state.selectedRemoteAdb,
+    selectedAdbDevice: state.selectedAdbDevice,
+    scrcpyOptions: state.scrcpyOptions,
   };
   localStorage.setItem(storageKey, JSON.stringify(value));
+}
+
+function currentRemoteAdbAddress(): string {
+  return normalizeRemoteAdbAddress(state.remoteAdbInput) || state.selectedRemoteAdb;
+}
+
+function normalizeRemoteAdbAddress(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const withoutScheme = trimmed.replace(/^tcp:\/\//i, "");
+  return withoutScheme.includes(":") ? withoutScheme : `${withoutScheme}:5555`;
+}
+
+function normalizeRemoteAdbHistory(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const history: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+
+    const address = normalizeRemoteAdbAddress(item);
+    if (!address || seen.has(address)) {
+      continue;
+    }
+
+    seen.add(address);
+    history.push(address);
+  }
+
+  return history;
+}
+
+function normalizeScrcpyVideoCodec(value: unknown): ScrcpyVideoCodec {
+  return value === "h264" || value === "av1" ? value : "h265";
+}
+
+function normalizeScrcpyBitRate(value: unknown): string {
+  if (typeof value !== "string") {
+    return defaultScrcpyBitRate;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : defaultScrcpyBitRate;
+}
+
+function remoteAdbPickerLabel(): string {
+  if (!state.selectedRemoteAdb) {
+    return "未保存远程设备";
+  }
+
+  return `${state.selectedRemoteAdb} · ${adbStateText(remoteAdbStatus(state.selectedRemoteAdb))}`;
+}
+
+function adbDevicePickerLabel(): string {
+  if (!state.selectedAdbDevice) {
+    return "未找到 ADB 设备";
+  }
+
+  return `${state.selectedAdbDevice} · ${adbStateText(adbDeviceState(state.selectedAdbDevice))}`;
+}
+
+function remoteAdbStatus(address: string): string {
+  if (!address) {
+    return "disconnected";
+  }
+
+  return state.adbDevices.find((device) => device.id === address)?.state ?? "disconnected";
+}
+
+function adbDeviceState(deviceId: string): string {
+  if (!deviceId) {
+    return "disconnected";
+  }
+
+  return state.adbDevices.find((device) => device.id === deviceId)?.state ?? "disconnected";
+}
+
+function adbDeviceDetail(device: AdbDevice): string {
+  const source = device.is_remote ? "远程" : "USB";
+  const running = state.scrcpyDevices.includes(device.id) ? " · scrcpy 已开" : "";
+  return `${source} · ${adbStateText(device.state)}${running}`;
+}
+
+function adbStateText(value: string): string {
+  if (value === "device") {
+    return "已连接";
+  }
+  if (value === "offline") {
+    return "离线";
+  }
+  if (value === "unauthorized") {
+    return "未授权";
+  }
+  if (value === "disconnected") {
+    return "未连接";
+  }
+  return value || "未知";
+}
+
+function adbStatusTone(value: string): string {
+  if (value === "device") {
+    return "connected";
+  }
+  if (value === "disconnected") {
+    return "disconnected";
+  }
+  return "warning";
+}
+
+function remoteAdbButtonText(): string {
+  if (state.adbBusy) {
+    return "ADB 处理中";
+  }
+
+  return remoteAdbStatus(currentRemoteAdbAddress()) === "device" ? "断开 ADB" : "连接 ADB";
+}
+
+function remoteAdbDetailText(address: string): string {
+  if (!address) {
+    return "输入 IP 或选择历史设备";
+  }
+
+  return `${address} · ${adbStateText(remoteAdbStatus(address))}`;
+}
+
+function isScrcpyRunning(deviceId: string): boolean {
+  return !!deviceId && state.scrcpyDevices.includes(deviceId);
+}
+
+function scrcpyParametersLocked(): boolean {
+  return state.scrcpyBusy || isScrcpyRunning(state.selectedAdbDevice);
+}
+
+function selectedScrcpyOptions(): ScrcpyOptions {
+  if (isScrcpyRunning(state.selectedAdbDevice)) {
+    return state.scrcpySessionOptions[state.selectedAdbDevice] ?? state.scrcpyOptions;
+  }
+
+  return state.scrcpyOptions;
+}
+
+function copyScrcpyOptions(options: ScrcpyOptions): ScrcpyOptions {
+  return {
+    video_codec: options.video_codec,
+    video_bit_rate: options.video_bit_rate,
+  };
+}
+
+function cleanupScrcpySessionOptions(): void {
+  const runningDevices = new Set(state.scrcpyDevices);
+  for (const deviceId of Object.keys(state.scrcpySessionOptions)) {
+    if (!runningDevices.has(deviceId)) {
+      delete state.scrcpySessionOptions[deviceId];
+    }
+  }
+}
+
+function canToggleScrcpy(): boolean {
+  if (!state.selectedAdbDevice) {
+    return false;
+  }
+
+  return isScrcpyRunning(state.selectedAdbDevice) || adbDeviceState(state.selectedAdbDevice) === "device";
+}
+
+function scrcpyButtonText(): string {
+  if (state.scrcpyBusy) {
+    return "scrcpy 处理中";
+  }
+
+  return isScrcpyRunning(state.selectedAdbDevice) ? "断开 scrcpy" : "打开 scrcpy";
+}
+
+function scrcpyDetailText(): string {
+  if (!state.selectedAdbDevice) {
+    return "请选择 ADB 设备";
+  }
+
+  const deviceState = adbDeviceState(state.selectedAdbDevice);
+  const scrcpyState = isScrcpyRunning(state.selectedAdbDevice) ? "scrcpy 已打开" : "scrcpy 未打开";
+  return `${adbStateText(deviceState)} · ${scrcpyState}`;
+}
+
+function isTextInputActive(): boolean {
+  const active = document.activeElement;
+  return active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
+}
+
+function serialSettingsLocked(): boolean {
+  return state.mode === "connected" || state.mode === "connecting";
 }
 
 function statusTone(): string {
@@ -1352,6 +2129,16 @@ function connectionSummaryText(): string {
 
 function serialProfileText(): string {
   return `${state.config.data_bits}${parityLabel(state.config.parity)}${state.config.stop_bits}`;
+}
+
+function parityText(parity: Parity): string {
+  if (parity === "even") {
+    return "偶";
+  }
+  if (parity === "odd") {
+    return "奇";
+  }
+  return "无";
 }
 
 function parityLabel(parity: Parity): string {
@@ -1480,3 +2267,10 @@ renderApp();
 void setupBackendListeners();
 void refreshFonts();
 void refreshPorts();
+void refreshAdbState();
+window.setInterval(() => {
+  void refreshAdbState(false);
+}, adbStateRefreshIntervalMs);
+window.setInterval(() => {
+  void refreshScrcpyState(false);
+}, scrcpyStateRefreshIntervalMs);

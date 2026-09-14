@@ -2,8 +2,11 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serialport::{DataBits, Parity, SerialPort, StopBits};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
+    env,
     io::{ErrorKind, Read, Write},
+    path::PathBuf,
+    process::{Child, Command, Output},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -14,7 +17,13 @@ use std::{
 use tauri::{AppHandle, Emitter, State};
 
 #[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
 mod windows_serial;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const SERIAL_READ_BUFFER_SIZE: usize = 4 * 1024;
 const SERIAL_READ_TIMEOUT_MS: u64 = 5;
@@ -37,6 +46,19 @@ struct SerialState {
     writer: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct AndroidManager {
+    scrcpy_processes: Mutex<HashMap<String, Child>>,
+}
+
+impl Drop for AndroidManager {
+    fn drop(&mut self) {
+        if let Ok(processes) = self.scrcpy_processes.get_mut() {
+            stop_all_scrcpy_locked(processes);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct SerialConfig {
     port_name: String,
@@ -55,6 +77,31 @@ struct SerialData {
 #[derive(Clone, Debug, Serialize)]
 struct SerialError {
     message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AdbCommandResult {
+    address: String,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AdbDevice {
+    id: String,
+    state: String,
+    is_remote: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AndroidState {
+    devices: Vec<AdbDevice>,
+    scrcpy_devices: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ScrcpyOptions {
+    video_codec: String,
+    video_bit_rate: String,
 }
 
 #[tauri::command]
@@ -168,6 +215,128 @@ fn write_text(manager: State<'_, SerialManager>, text: String) -> Result<(), Str
 #[tauri::command]
 fn report_perf(message: String) {
     eprintln!("[serial-terminal perf] {message}");
+}
+
+#[tauri::command]
+fn adb_connect(address: String) -> Result<AdbCommandResult, String> {
+    let address = normalize_adb_address(&address)?;
+    let message = run_adb_command(&["connect", &address])?;
+
+    if is_adb_connect_failure(&message) {
+        return Err(format!(
+            "ADB 连接失败: {}",
+            fallback_command_message(&message)
+        ));
+    }
+
+    Ok(AdbCommandResult { address, message })
+}
+
+#[tauri::command]
+fn adb_disconnect(address: String) -> Result<AdbCommandResult, String> {
+    let address = normalize_adb_address(&address)?;
+    let message = run_adb_command(&["disconnect", &address])?;
+    Ok(AdbCommandResult { address, message })
+}
+
+#[tauri::command]
+fn list_adb_state(manager: State<'_, AndroidManager>) -> Result<AndroidState, String> {
+    let output = run_adb_command(&["devices"])?;
+    let devices = parse_adb_devices(&output);
+    let scrcpy_devices = {
+        let mut processes = manager
+            .scrcpy_processes
+            .lock()
+            .map_err(|_| "scrcpy 状态锁已损坏".to_string())?;
+        cleanup_scrcpy_locked(&mut processes);
+        scrcpy_devices_locked(&processes)
+    };
+
+    Ok(AndroidState {
+        devices,
+        scrcpy_devices,
+    })
+}
+
+#[tauri::command]
+fn list_scrcpy_devices(manager: State<'_, AndroidManager>) -> Result<Vec<String>, String> {
+    let mut processes = manager
+        .scrcpy_processes
+        .lock()
+        .map_err(|_| "scrcpy 状态锁已损坏".to_string())?;
+    cleanup_scrcpy_locked(&mut processes);
+    Ok(scrcpy_devices_locked(&processes))
+}
+
+#[tauri::command]
+fn start_scrcpy(
+    manager: State<'_, AndroidManager>,
+    device_id: String,
+    options: ScrcpyOptions,
+) -> Result<(), String> {
+    let device_id = normalize_device_id(&device_id)?;
+    let options = normalize_scrcpy_options(options)?;
+
+    {
+        let mut processes = manager
+            .scrcpy_processes
+            .lock()
+            .map_err(|_| "scrcpy 状态锁已损坏".to_string())?;
+        cleanup_scrcpy_locked(&mut processes);
+        if processes.contains_key(&device_id) {
+            return Ok(());
+        }
+    }
+
+    let scrcpy_path = find_tool_path("scrcpy")?;
+    let mut command = Command::new(&scrcpy_path);
+    if let Some(scrcpy_dir) = scrcpy_path.parent() {
+        command.current_dir(scrcpy_dir);
+    }
+    command
+        .arg("-s")
+        .arg(&device_id)
+        .arg(format!("--video-codec={}", options.video_codec))
+        .arg(format!("--video-bit-rate={}", options.video_bit_rate));
+    hide_command_window(&mut command);
+
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "启动 scrcpy 失败: {error} ({})",
+            scrcpy_path.to_string_lossy()
+        )
+    })?;
+
+    thread::sleep(Duration::from_millis(150));
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!("scrcpy 启动后立即退出: {status}"));
+    }
+
+    let mut processes = manager
+        .scrcpy_processes
+        .lock()
+        .map_err(|_| "scrcpy 状态锁已损坏".to_string())?;
+    cleanup_scrcpy_locked(&mut processes);
+    processes.insert(device_id, child);
+
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_scrcpy(manager: State<'_, AndroidManager>, device_id: String) -> Result<(), String> {
+    let device_id = normalize_device_id(&device_id)?;
+    let mut processes = manager
+        .scrcpy_processes
+        .lock()
+        .map_err(|_| "scrcpy 状态锁已损坏".to_string())?;
+    cleanup_scrcpy_locked(&mut processes);
+
+    if let Some(mut child) = processes.remove(&device_id) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    Ok(())
 }
 
 fn spawn_reader<R>(app: AppHandle, mut port: R, reader_stop: Arc<AtomicBool>) -> JoinHandle<()>
@@ -446,10 +615,200 @@ fn font_families_from_registry_name(name: &str) -> Vec<String> {
         .collect()
 }
 
+fn normalize_adb_address(address: &str) -> Result<String, String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err("请输入远程 ADB 地址".to_string());
+    }
+
+    let address = trimmed.strip_prefix("tcp://").unwrap_or(trimmed);
+    if address.contains(':') {
+        Ok(address.to_string())
+    } else {
+        Ok(format!("{address}:5555"))
+    }
+}
+
+fn normalize_device_id(device_id: &str) -> Result<String, String> {
+    let trimmed = device_id.trim();
+    if trimmed.is_empty() {
+        return Err("请选择一个 ADB 设备".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_scrcpy_options(options: ScrcpyOptions) -> Result<ScrcpyOptions, String> {
+    let video_codec = options.video_codec.trim().to_ascii_lowercase();
+    if !matches!(video_codec.as_str(), "h264" | "h265" | "av1") {
+        return Err(format!("不支持的视频编码: {}", options.video_codec));
+    }
+
+    let video_bit_rate = options.video_bit_rate.trim().to_string();
+    if video_bit_rate.is_empty() {
+        return Err("请输入 scrcpy 视频码率".to_string());
+    }
+
+    if video_bit_rate.len() > 16
+        || !video_bit_rate
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || value == '.')
+    {
+        return Err("scrcpy 视频码率只支持数字、字母和小数点，例如 8M".to_string());
+    }
+
+    Ok(ScrcpyOptions {
+        video_codec,
+        video_bit_rate,
+    })
+}
+
+fn run_adb_command(args: &[&str]) -> Result<String, String> {
+    let adb_path = find_tool_path("adb")?;
+    let mut command = Command::new(&adb_path);
+    if let Some(adb_dir) = adb_path.parent() {
+        command.current_dir(adb_dir);
+    }
+    command.args(args);
+    hide_command_window(&mut command);
+
+    let output = command
+        .output()
+        .map_err(|error| format!("执行 adb 失败: {error} ({})", adb_path.to_string_lossy()))?;
+    let message = command_output_text(&output);
+
+    if !output.status.success() {
+        return Err(format!(
+            "adb 执行失败: {}",
+            fallback_command_message(&message)
+        ));
+    }
+
+    Ok(message)
+}
+
+fn parse_adb_devices(output: &str) -> Vec<AdbDevice> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('*')
+                || trimmed.eq_ignore_ascii_case("List of devices attached")
+            {
+                return None;
+            }
+
+            let mut parts = trimmed.split_whitespace();
+            let id = parts.next()?.to_string();
+            let state = parts.next().unwrap_or("unknown").to_string();
+
+            Some(AdbDevice {
+                is_remote: id.contains(':'),
+                id,
+                state,
+            })
+        })
+        .collect()
+}
+
+fn is_adb_connect_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("failed")
+        || lower.contains("unable")
+        || lower.contains("cannot")
+        || lower.contains("refused")
+        || lower.contains("no route")
+}
+
+fn find_tool_path(tool: &str) -> Result<PathBuf, String> {
+    let filename = tool_filename(tool);
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            let candidate = exe_dir.join(&filename);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    if let Some(path_value) = env::var_os("PATH") {
+        for path in env::split_paths(&path_value) {
+            let candidate = path.join(&filename);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(format!(
+        "未找到 {filename}，请将它放到程序同级目录，或加入系统 PATH"
+    ))
+}
+
+fn tool_filename(tool: &str) -> String {
+    if cfg!(windows) {
+        format!("{tool}.exe")
+    } else {
+        tool.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut Command) {}
+
+fn command_output_text(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn fallback_command_message(message: &str) -> String {
+    if message.trim().is_empty() {
+        "没有输出".to_string()
+    } else {
+        message.trim().to_string()
+    }
+}
+
+fn cleanup_scrcpy_locked(processes: &mut HashMap<String, Child>) {
+    processes.retain(|_, child| match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(_) => false,
+    });
+}
+
+fn scrcpy_devices_locked(processes: &HashMap<String, Child>) -> Vec<String> {
+    let mut devices = processes.keys().cloned().collect::<Vec<_>>();
+    devices.sort();
+    devices
+}
+
+fn stop_all_scrcpy_locked(processes: &mut HashMap<String, Child>) {
+    for child in processes.values_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    processes.clear();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(SerialManager::default())
+        .manage(AndroidManager::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             list_fonts,
@@ -457,7 +816,13 @@ pub fn run() {
             connect,
             disconnect,
             write_text,
-            report_perf
+            report_perf,
+            adb_connect,
+            adb_disconnect,
+            list_adb_state,
+            list_scrcpy_devices,
+            start_scrcpy,
+            stop_scrcpy
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
