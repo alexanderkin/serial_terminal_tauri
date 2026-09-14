@@ -14,7 +14,6 @@ type PickerId =
   | "parity"
   | "stopBits"
   | "font"
-  | "remoteAdb"
   | "adbDevice"
   | "scrcpyCodec";
 type ScrcpyVideoCodec = "h264" | "h265" | "av1";
@@ -143,6 +142,7 @@ interface AppState {
   adbShellBusy: boolean;
   activeTerminalId: string;
   adbShellDevices: string[];
+  remoteAdbMessage: string;
   androidMessage: string;
   androidError: string;
 }
@@ -182,6 +182,7 @@ const fallbackFontFamilies = [
 ];
 
 const storageKey = "serial-terminal-settings-v1";
+const defaultRemoteAdbAddress = "192.168.30.1:5555";
 const defaultScrcpyBitRate = "8M";
 const adbStateRefreshIntervalMs = 5000;
 const scrcpyStateRefreshIntervalMs = 800;
@@ -215,7 +216,7 @@ const state: AppState = {
   fontSize: savedSettings.fontSize ?? 18,
   lineSpacing: savedSettings.lineSpacing ?? 1,
   remoteAdbHistory: savedSettings.remoteAdbHistory ?? [],
-  remoteAdbInput: savedSettings.selectedRemoteAdb ?? savedSettings.remoteAdbHistory?.[0] ?? "",
+  remoteAdbInput: defaultRemoteAdbAddress,
   selectedRemoteAdb: savedSettings.selectedRemoteAdb ?? savedSettings.remoteAdbHistory?.[0] ?? "",
   adbDevices: [],
   selectedAdbDevice: savedSettings.selectedAdbDevice ?? "",
@@ -230,6 +231,7 @@ const state: AppState = {
   adbShellBusy: false,
   activeTerminalId: serialTerminalId,
   adbShellDevices: [],
+  remoteAdbMessage: "",
   androidMessage: "",
   androidError: "",
 };
@@ -402,56 +404,15 @@ function restoreSidebarScroll(): void {
 }
 
 function renderAndroidSections(): string {
-  const remoteAddress = currentRemoteAdbAddress();
-  const remoteStatus = remoteAdbStatus(remoteAddress);
+  const remoteAddress = remoteAdbToggleAddress();
+  const remoteConnected = remoteAddress ? remoteAdbStatus(remoteAddress) === "device" : false;
   const selectedDeviceStatus = adbDeviceState(state.selectedAdbDevice);
   const scrcpyRunning = isScrcpyRunning(state.selectedAdbDevice);
   const scrcpyOptions = selectedScrcpyOptions();
   const parametersLocked = scrcpyParametersLocked();
-  const remoteDetail = remoteAdbDetailText(remoteAddress);
   const scrcpyDetail = scrcpyDetailText();
 
   return `
-    <section class="settings-section">
-      <div class="section-title section-title-row">
-        <span>远程 ADB</span>
-        <span class="section-status">
-          <span id="remote-adb-status-dot" class="small-dot ${adbStatusTone(remoteStatus)}"></span>
-          <span id="remote-adb-status-text" title="${escapeAttribute(remoteDetail)}">${escapeHtml(remoteDetail)}</span>
-        </span>
-      </div>
-      <label class="field">
-        <span>IP 地址</span>
-        <input
-          id="remote-adb-address"
-          class="text-input"
-          type="text"
-          spellcheck="false"
-          autocomplete="off"
-          placeholder="192.168.1.20:5555"
-          value="${escapeAttribute(state.remoteAdbInput)}"
-          ${state.adbBusy ? "disabled" : ""}
-        />
-      </label>
-      <label class="field">
-        <span>历史设备</span>
-        <div class="field-row">
-          ${renderPicker("remoteAdb", pickerLabel("remoteAdb"), state.adbBusy || state.remoteAdbHistory.length === 0)}
-          <button id="refresh-adb" class="secondary-button" type="button" ${state.adbBusy ? "disabled" : ""}>
-            刷新
-          </button>
-        </div>
-      </label>
-      <button
-        id="adb-toggle"
-        class="secondary-button full-button ${remoteStatus === "device" ? "danger-button" : ""}"
-        type="button"
-        ${state.adbBusy || !remoteAddress ? "disabled" : ""}
-      >
-        ${remoteAdbButtonText()}
-      </button>
-    </section>
-
     <section class="settings-section">
       <div class="section-title section-title-row">
         <span>SCRCPY</span>
@@ -474,6 +435,28 @@ function renderAndroidSections(): string {
           </button>
         </div>
       </label>
+      <label class="field">
+        <span class="field-label-row">
+          <span>远程 ADB IP</span>
+          <span
+            id="remote-adb-inline-status"
+            class="field-inline-status"
+            title="${escapeAttribute(state.remoteAdbMessage)}"
+          >
+            ${escapeHtml(state.remoteAdbMessage)}
+          </span>
+        </span>
+        <input
+          id="remote-adb-address"
+          class="text-input"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="${defaultRemoteAdbAddress}"
+          value="${escapeAttribute(state.remoteAdbInput)}"
+          ${state.adbBusy ? "disabled" : ""}
+        />
+      </label>
       <div class="scrcpy-options-row">
         <label class="field compact-field">
           <span>视频编码</span>
@@ -493,6 +476,15 @@ function renderAndroidSections(): string {
           />
         </label>
       </div>
+      <button
+        id="adb-toggle"
+        class="secondary-button full-button ${remoteConnected ? "danger-button" : ""}"
+        type="button"
+        title="${escapeAttribute(remoteAdbButtonTitle())}"
+        ${state.adbBusy || !canToggleRemoteAdb() ? "disabled" : ""}
+      >
+        ${remoteAdbButtonText()}
+      </button>
       <button
         id="scrcpy-toggle"
         class="primary-button ${scrcpyRunning ? "connected" : ""}"
@@ -839,7 +831,7 @@ function bindAndroidEvents(): void {
   const remoteAdbAddress = document.querySelector<HTMLInputElement>("#remote-adb-address");
   remoteAdbAddress?.addEventListener("input", () => {
     state.remoteAdbInput = remoteAdbAddress.value;
-    syncRemoteSelectionFromInput();
+    state.remoteAdbMessage = "";
     updateAndroidControls();
   });
   remoteAdbAddress?.addEventListener("keydown", (event) => {
@@ -851,10 +843,6 @@ function bindAndroidEvents(): void {
 
   document.querySelector("#adb-toggle")?.addEventListener("click", () => {
     void toggleRemoteAdb();
-  });
-
-  document.querySelector("#refresh-adb")?.addEventListener("click", () => {
-    void refreshAdbState();
   });
 
   document.querySelector("#refresh-scrcpy-devices")?.addEventListener("click", () => {
@@ -1185,11 +1173,9 @@ function selectPickerOption(id: PickerId, value: string): void {
     state.fontFamily = value;
     state.availableFonts = mergeFonts([value, ...state.availableFonts]);
     applyTerminalOptions();
-  } else if (id === "remoteAdb") {
-    state.selectedRemoteAdb = value;
-    state.remoteAdbInput = value;
   } else if (id === "adbDevice") {
     state.selectedAdbDevice = value;
+    syncRemoteAdbInputWithSelectedDevice(true);
   } else if (id === "scrcpyCodec") {
     if (scrcpyParametersLocked()) {
       closePicker();
@@ -1219,9 +1205,6 @@ function pickerLabel(id: PickerId): string {
   }
   if (id === "stopBits") {
     return String(state.config.stop_bits);
-  }
-  if (id === "remoteAdb") {
-    return remoteAdbPickerLabel();
   }
   if (id === "adbDevice") {
     return adbDevicePickerLabel();
@@ -1263,18 +1246,6 @@ function pickerOptions(id: PickerId): PickerOption[] {
     }));
   }
 
-  if (id === "remoteAdb") {
-    return state.remoteAdbHistory.map((address) => {
-      const status = remoteAdbStatus(address);
-      return {
-        label: address,
-        value: address,
-        status,
-        detail: adbStateText(status),
-      };
-    });
-  }
-
   if (id === "adbDevice") {
     return state.adbDevices.map((device) => ({
       label: device.id,
@@ -1312,9 +1283,6 @@ function isPickerOptionActive(option: PickerOption): boolean {
   }
   if (state.activePicker === "stopBits") {
     return Number(option.value) === state.config.stop_bits;
-  }
-  if (state.activePicker === "remoteAdb") {
-    return option.value === state.selectedRemoteAdb;
   }
   if (state.activePicker === "adbDevice") {
     return option.value === state.selectedAdbDevice;
@@ -1452,11 +1420,7 @@ function applyAndroidState(androidState: AndroidStatePayload): void {
     const firstOnlineDevice = state.adbDevices.find((device) => device.state === "device");
     state.selectedAdbDevice = firstOnlineDevice?.id ?? state.adbDevices[0]?.id ?? "";
   }
-
-  if (!state.selectedRemoteAdb && state.remoteAdbHistory.length > 0) {
-    state.selectedRemoteAdb = state.remoteAdbHistory[0];
-    state.remoteAdbInput = state.selectedRemoteAdb;
-  }
+  syncRemoteAdbInputWithSelectedDevice(false);
 
   saveSettings();
 }
@@ -1469,9 +1433,10 @@ function applyScrcpyDevices(deviceIds: string[]): boolean {
 }
 
 async function toggleRemoteAdb(): Promise<void> {
-  const address = currentRemoteAdbAddress();
+  const typedAddress = normalizeRemoteAdbAddress(state.remoteAdbInput);
+  const address = remoteAdbToggleAddress();
   if (!address) {
-    state.androidError = "请输入远程 ADB 地址";
+    state.androidError = "请输入远程 ADB IP，或在 ADB 设备中选择已连接的远程设备";
     renderApp();
     return;
   }
@@ -1480,6 +1445,7 @@ async function toggleRemoteAdb(): Promise<void> {
   state.adbBusy = true;
   state.androidError = "";
   state.androidMessage = "";
+  state.remoteAdbMessage = "";
   renderApp();
 
   try {
@@ -1489,8 +1455,13 @@ async function toggleRemoteAdb(): Promise<void> {
 
     addRemoteAdbHistory(result.address);
     state.selectedRemoteAdb = result.address;
-    state.remoteAdbInput = result.address;
-    state.androidMessage =
+    if (connected) {
+      state.remoteAdbInput = typedAddress ? result.address : "";
+    } else {
+      state.remoteAdbInput = result.address;
+      state.selectedAdbDevice = result.address;
+    }
+    state.remoteAdbMessage =
       result.message || `${connected ? "已断开" : "已连接"} ${result.address}`;
   } catch (error) {
     state.androidError = toMessage(error);
@@ -1700,21 +1671,11 @@ function addRemoteAdbHistory(address: string): void {
   saveSettings();
 }
 
-function syncRemoteSelectionFromInput(): void {
-  const normalized = normalizeRemoteAdbAddress(state.remoteAdbInput);
-  state.selectedRemoteAdb = state.remoteAdbHistory.includes(normalized) ? normalized : "";
-}
-
 function updateAndroidControls(): void {
-  const remoteAddress = currentRemoteAdbAddress();
-  const remoteStatus = remoteAdbStatus(remoteAddress);
+  const remoteAddress = remoteAdbToggleAddress();
+  const remoteConnected = remoteAddress ? remoteAdbStatus(remoteAddress) === "device" : false;
   const parametersLocked = scrcpyParametersLocked();
   const scrcpyOptions = selectedScrcpyOptions();
-  updatePickerButtonState(
-    "remoteAdb",
-    pickerLabel("remoteAdb"),
-    state.adbBusy || state.remoteAdbHistory.length === 0,
-  );
   updatePickerButtonState(
     "adbDevice",
     pickerLabel("adbDevice"),
@@ -1724,21 +1685,20 @@ function updateAndroidControls(): void {
 
   const adbToggle = document.querySelector<HTMLButtonElement>("#adb-toggle");
   if (adbToggle) {
-    adbToggle.disabled = state.adbBusy || !remoteAddress;
+    adbToggle.disabled = state.adbBusy || !canToggleRemoteAdb();
     adbToggle.textContent = remoteAdbButtonText();
-    adbToggle.classList.toggle("danger-button", remoteStatus === "device");
+    adbToggle.title = remoteAdbButtonTitle();
+    adbToggle.classList.toggle("danger-button", remoteConnected);
   }
 
-  const refreshAdb = document.querySelector<HTMLButtonElement>("#refresh-adb");
-  if (refreshAdb) {
-    refreshAdb.disabled = state.adbBusy;
+  const remoteAdbAddress = document.querySelector<HTMLInputElement>("#remote-adb-address");
+  if (remoteAdbAddress) {
+    remoteAdbAddress.disabled = state.adbBusy;
+    if (document.activeElement !== remoteAdbAddress) {
+      remoteAdbAddress.value = state.remoteAdbInput;
+    }
   }
-
-  const remoteStatusDot = document.querySelector("#remote-adb-status-dot");
-  if (remoteStatusDot) {
-    remoteStatusDot.className = `small-dot ${adbStatusTone(remoteStatus)}`;
-  }
-  updateTextWithTitle("#remote-adb-status-text", remoteAdbDetailText(remoteAddress));
+  updateTextWithTitle("#remote-adb-inline-status", state.remoteAdbMessage);
 
   const refreshScrcpyDevices =
     document.querySelector<HTMLButtonElement>("#refresh-scrcpy-devices");
@@ -2280,10 +2240,6 @@ function saveSettings(): void {
   localStorage.setItem(storageKey, JSON.stringify(value));
 }
 
-function currentRemoteAdbAddress(): string {
-  return normalizeRemoteAdbAddress(state.remoteAdbInput) || state.selectedRemoteAdb;
-}
-
 function normalizeRemoteAdbAddress(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -2318,6 +2274,76 @@ function normalizeRemoteAdbHistory(value: unknown): string[] {
   return history;
 }
 
+function selectedAdbDeviceInfo(): AdbDevice | undefined {
+  return state.adbDevices.find((device) => device.id === state.selectedAdbDevice);
+}
+
+function hasRemoteAdbDevice(): boolean {
+  return state.adbDevices.some((device) => device.is_remote);
+}
+
+function isRemoteAdbInputActive(): boolean {
+  return document.activeElement?.id === "remote-adb-address";
+}
+
+function syncRemoteAdbInputWithSelectedDevice(force: boolean): void {
+  if (!force && isRemoteAdbInputActive()) {
+    return;
+  }
+
+  const selectedDevice = selectedAdbDeviceInfo();
+  if (selectedDevice?.is_remote) {
+    state.selectedRemoteAdb = selectedDevice.id;
+    const normalizedInput = normalizeRemoteAdbAddress(state.remoteAdbInput);
+    if (
+      force ||
+      !normalizedInput ||
+      normalizedInput === defaultRemoteAdbAddress ||
+      normalizedInput === selectedDevice.id
+    ) {
+      state.remoteAdbInput = selectedDevice.id;
+    }
+    return;
+  }
+
+  state.selectedRemoteAdb = "";
+  if (!hasRemoteAdbDevice()) {
+    if (force || !normalizeRemoteAdbAddress(state.remoteAdbInput)) {
+      state.remoteAdbInput = defaultRemoteAdbAddress;
+    }
+  } else if (force) {
+    state.remoteAdbInput = "";
+  }
+}
+
+function remoteAdbToggleAddress(): string {
+  const typedAddress = normalizeRemoteAdbAddress(state.remoteAdbInput);
+  if (typedAddress) {
+    return typedAddress;
+  }
+
+  const selectedDevice = selectedAdbDeviceInfo();
+  if (selectedDevice?.is_remote) {
+    return selectedDevice.id;
+  }
+
+  return "";
+}
+
+function canToggleRemoteAdb(): boolean {
+  if (state.adbBusy) {
+    return false;
+  }
+
+  const typedAddress = normalizeRemoteAdbAddress(state.remoteAdbInput);
+  if (typedAddress) {
+    return true;
+  }
+
+  const selectedDevice = selectedAdbDeviceInfo();
+  return !!selectedDevice?.is_remote && selectedDevice.state === "device";
+}
+
 function normalizeScrcpyVideoCodec(value: unknown): ScrcpyVideoCodec {
   return value === "h264" || value === "av1" ? value : "h265";
 }
@@ -2329,14 +2355,6 @@ function normalizeScrcpyBitRate(value: unknown): string {
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : defaultScrcpyBitRate;
-}
-
-function remoteAdbPickerLabel(): string {
-  if (!state.selectedRemoteAdb) {
-    return "未保存远程设备";
-  }
-
-  return `${state.selectedRemoteAdb} · ${adbStateText(remoteAdbStatus(state.selectedRemoteAdb))}`;
 }
 
 function adbDevicePickerLabel(): string {
@@ -2401,15 +2419,28 @@ function remoteAdbButtonText(): string {
     return "ADB 处理中";
   }
 
-  return remoteAdbStatus(currentRemoteAdbAddress()) === "device" ? "断开 ADB" : "连接 ADB";
+  return remoteAdbStatus(remoteAdbToggleAddress()) === "device"
+    ? "断开远程 ADB"
+    : "连接远程 ADB";
 }
 
-function remoteAdbDetailText(address: string): string {
-  if (!address) {
-    return "输入 IP 或选择历史设备";
+function remoteAdbButtonTitle(): string {
+  const typedAddress = normalizeRemoteAdbAddress(state.remoteAdbInput);
+  if (typedAddress) {
+    const action = remoteAdbStatus(typedAddress) === "device" ? "断开" : "连接";
+    return `${action} ${typedAddress}`;
   }
 
-  return `${address} · ${adbStateText(remoteAdbStatus(address))}`;
+  const selectedDevice = selectedAdbDeviceInfo();
+  if (selectedDevice?.is_remote && selectedDevice.state === "device") {
+    return `断开 ${selectedDevice.id}`;
+  }
+
+  if (selectedDevice && !selectedDevice.is_remote) {
+    return "本地 USB ADB 设备不需要远程连接";
+  }
+
+  return "输入远程 ADB IP，或选择已连接的远程设备";
 }
 
 function isScrcpyRunning(deviceId: string): boolean {
