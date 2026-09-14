@@ -6,7 +6,7 @@
 
 ## 下一步
 
-窗口拉伸时终端边缘黑色闪现问题已修复，等待用户实机复测 resize 视觉效果。
+异常退出兜底已实现；等待用户实机验证强杀/崩溃时 scrcpy 和 ADB Shell 子进程会被系统自动结束。
 
 ## 当前阶段
 
@@ -145,6 +145,20 @@
 - [x] 前端构建和 diff 检查验证
 - **状态：** complete
 
+### 阶段 17：退出时清理串口、ADB Shell 和 scrcpy
+- [x] 盘点现有串口、ADB shell、scrcpy 资源生命周期
+- [x] 增加后端统一 shutdown cleanup，避免只靠前端异步调用
+- [x] 将窗口关闭事件接入 cleanup
+- [x] 构建与检查验证
+- **状态：** complete
+
+### 阶段 18：崩溃/强杀时清理子进程兜底
+- [x] 明确非正常退出时进程内 cleanup 的边界
+- [x] 在 Windows 下用 Job Object 托管 scrcpy 和 ADB Shell 子进程
+- [x] 启动 scrcpy / ADB Shell 后立即加入 Job
+- [x] 构建与检查验证
+- **状态：** complete
+
 ## 关键问题
 
 1. 终端核心必须使用成熟库处理 ANSI、IME、宽字符、滚动缓冲和选择，不能继续手写简化版。
@@ -175,6 +189,8 @@
 | 串口 TX 走低延迟路径 | 删除和快速输入是交互输入，不能再用 40ms debounce 或 writer drain 把按键合并成块 |
 | 用分支验证 xterm.js | 主线保留稳定状态，单独在 `codex/xterm-js` 分支 A/B 测试普通 xterm.js |
 | xterm 内部背景统一到终端背景 | xterm 的字符网格按离散列/行 resize，连续拉伸时会露出内部层背景；内部层不能保留默认黑色 |
+| 退出清理由 Rust 后端兜底 | 窗口关闭时前端异步调用不一定完成；串口句柄和子进程应由 Tauri 后端在 close/destroy 生命周期里统一停止 |
+| 崩溃/强杀场景对子进程使用 Windows Job Object | 进程被强杀或崩溃时 Rust 代码不能保证继续执行；Job Object 的 `KILL_ON_JOB_CLOSE` 能让系统在主进程句柄关闭后自动结束已加入的子进程 |
 
 ## 遇到的错误
 

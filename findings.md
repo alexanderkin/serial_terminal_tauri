@@ -58,6 +58,11 @@
 - xterm 默认 CSS 中 `.xterm .xterm-viewport` 使用 `background-color: #000`，composition view 和 scrollbar shadow 也有黑色默认值。
 - xterm 的 screen/canvas 实际尺寸按字符宽高的整数列/行变化；窗口连续拉伸时，host 尺寸会先变化，而 terminal screen 会在下一次 fit 到新列/行时跳变，因此边缘剩余区域会周期性出现/消失。
 - 如果 xterm 内部 viewport/screen/scrollbar track 的背景与外层终端背景不一致，resize 时这些剩余区域会表现为黑色闪动或黑边。
+- 当前 Tauri 后端已保存 scrcpy 子进程和 ADB shell 子进程句柄；AndroidManager 的 Drop 会做兜底释放，但窗口关闭时最好主动清理一次，避免前端窗口已经消失后子进程继续短暂存在。
+- 当前串口 `SerialManager` 原先没有 Drop 兜底；只靠前端在关闭前调用 `disconnect` 不可靠，因为窗口关闭时异步 IPC 可能来不及完成。
+- 被任务管理器强杀、段错误崩溃等非正常退出时，Rust `Drop`、Tauri `CloseRequested` 和普通清理函数都不能保证执行；需要依赖操作系统资源所有权和子进程托管机制。
+- Windows 会在进程结束时自动关闭该进程持有的串口 HANDLE，因此串口占用在崩溃/强杀后会由系统释放；scrcpy 和 `adb shell` 是独立子进程，需要放进 Job Object 才能跟随主进程消亡。
+- `windows-sys 0.52.0` 已提供 `CreateJobObjectW`、`SetInformationJobObject`、`AssignProcessToJobObject`、`JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 和 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，可直接用于本项目的 Windows 子进程兜底清理。
 
 ## 技术决策
 | 决策 | 理由 |
@@ -88,6 +93,9 @@
 | writer 不再 drain 合并小包 | 快速输入/删除需要按键级到达设备，后台线程不应再把多个按键主动合成一次 `write_all` |
 | xterm 分支不引入 WebGL addon | 用户要求普通 xterm.js，本分支只使用 `@xterm/xterm` 和 `@xterm/addon-fit` |
 | 覆盖 xterm 内部背景 | resize 时字符网格不能连续填满所有像素，必须让所有可能露出的内部层使用同一终端背景色 |
+| 退出清理由后端生命周期统一处理 | 串口句柄和 adb/scrcpy 子进程属于后端资源；窗口关闭时直接从 Tauri 后端清理比依赖前端异步调用更可靠 |
+| 崩溃/强杀场景对子进程使用 Windows Job Object | 进程被强杀或崩溃时 Rust 代码不能保证继续执行；Job Object 的 `KILL_ON_JOB_CLOSE` 能让系统在主进程句柄关闭后自动结束已加入的子进程 |
+| Job Object 仅托管长生命周期子进程 | `adb connect/devices` 这类短命令不放入长生命周期 Job，避免影响 adb server；仅将 scrcpy 和交互式 `adb shell` 加入主进程生命周期托管 |
 
 ## 遇到的问题
 | 问题 | 解决方案 |
@@ -108,6 +116,8 @@
 | 删除和快速输入仍成块 | 移除前端 Backspace/普通输入 debounce；提高 invoke 并发上限；后端 writer 改为每个入队包单独 `write_all` |
 | 切回 xterm.js 需要重新处理键盘语义 | 将 Ctrl+C 选区复制处理改为返回 `false` 阻止 xterm 发送中断 |
 | xterm resize 黑边 | 将 root、viewport、screen、scroll area、scrollable element、scrollbar track 统一设为 `--terminal`，并给 screen 设置最小 100% 宽高 |
+| 关闭软件后可能残留串口、ADB shell 或 scrcpy 进程 | 给 `SerialManager` 增加 Drop 兜底，并在 `CloseRequested` 窗口事件中主动调用串口、ADB shell、scrcpy 的统一 cleanup |
+| 主进程崩溃/强杀时进程内 cleanup 无法可靠执行 | 用 Windows Job Object 管理 scrcpy/ADB Shell 子进程，主进程消亡时 Job 句柄关闭并由系统结束子进程；串口 HANDLE 由系统自动关闭 |
 
 ## 资源
 - 本地 `serial_terminal` Tauri 项目。
@@ -125,6 +135,8 @@
 - 本轮直接 COM5 测试结果：120 次回车对应 120 个读事件、每个读事件 25 字节/1 个换行；这证明行级输出在应用外是成立的。
 - 本轮发现当前 COM5 被正在运行的 `serial_terminal.exe` 占用，因此没有强行做直接串口删除测试，避免打断用户正在测试的实例。
 - 本轮 `codex/xterm-js` 分支 Tauri dev 已启动到 `target\debug\serial_terminal.exe`，无立即崩溃。
+- 本轮退出清理改动后，`cargo check --manifest-path src-tauri\Cargo.toml` 通过，`git diff --check` 通过；仅有已知路径 canonicalize 和 CRLF 提醒。
+- 本轮崩溃/强杀兜底改动后，`cargo check --manifest-path src-tauri\Cargo.toml`、`npm run build` 和 `git diff --check` 均通过；仅有已知路径 canonicalize、npm 版本提示和 CRLF 提醒。
 
 ---
 *每执行2次查看/浏览器或搜索操作后更新此文件*

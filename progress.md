@@ -263,6 +263,41 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 17：退出时清理串口、ADB Shell 和 scrcpy
+- **状态：** complete
+- 执行的操作：
+  - 恢复根 Tauri 项目规划状态，并确认本轮改动目标是根项目而非 `serial_terminal_eui`。
+  - 盘点 `src-tauri/src/lib.rs` 中串口、scrcpy 和 ADB shell 的资源持有方式。
+  - 发现 AndroidManager 已有 Drop 兜底，但串口 SerialManager 缺少 Drop；同时窗口关闭时没有主动调用统一清理。
+  - 为 `SerialManager` 增加 Drop，退出时兜底调用 `close_locked()` 释放读写线程和串口句柄。
+  - 抽出 `close_serial_manager()`、`close_android_manager()`、`cleanup_runtime_resources()`，统一关闭串口、scrcpy 子进程和 ADB shell 子进程。
+  - 在 Tauri `WindowEvent::CloseRequested` 中主动执行 cleanup，确保点窗口关闭时立即释放所有后端资源。
+  - 运行 Rust 格式化、`cargo check` 和 `git diff --check` 验证。
+- 创建/修改的文件：
+  - `src-tauri/src/lib.rs`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
+### 阶段 18：崩溃/强杀时清理子进程兜底
+- **状态：** complete
+- 执行的操作：
+  - 明确非正常退出边界：主进程被任务管理器强杀或崩溃时，进程内 `Drop` / `CloseRequested` 不能保证执行。
+  - 确认串口句柄属于主进程资源，崩溃/强杀后 Windows 会自动关闭 HANDLE 并释放串口占用。
+  - 查询本地 `windows-sys 0.52.0`，确认可使用 Windows Job Object API。
+  - 在 `src-tauri/Cargo.toml` 为 `windows-sys` 增加 `Win32_System_JobObjects` feature。
+  - 新增 `ChildCleanupJob`，创建 Job Object 并设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。
+  - 在 AndroidManager 中持有长生命周期 Job Object，保证主进程存活期间 Job 句柄不关闭。
+  - scrcpy 和交互式 ADB Shell 子进程启动后立即加入 Job Object；若加入失败，会终止刚启动的子进程并返回错误，避免留下无法兜底清理的进程。
+  - 保持正常窗口关闭时的主动 cleanup 和 Drop 兜底不变。
+  - 运行 Rust 格式化、`cargo check`、前端构建和 `git diff --check` 验证。
+- 创建/修改的文件：
+  - `src-tauri/Cargo.toml`
+  - `src-tauri/src/lib.rs`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -324,6 +359,13 @@
 | `npm run tauri dev` | xterm.js 分支回切后 | 启动到 Tauri exe 且无立即崩溃 | 启动成功，手动 Ctrl+C 停止 | 通过 |
 | `npm run build` | xterm resize 黑边修复后 | TypeScript/Vite 构建通过 | 构建通过 | 通过 |
 | `git diff --check` | xterm resize 黑边修复后 | 无空白错误 | 通过，仅有 CRLF 提示 | 通过 |
+| `cargo fmt --manifest-path src-tauri\Cargo.toml` | 退出清理改动后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `cargo check --manifest-path src-tauri\Cargo.toml` | 退出清理改动后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `git diff --check` | 退出清理改动后 | 无空白错误 | 通过，仅有 CRLF 提示 | 通过 |
+| `cargo fmt --manifest-path src-tauri\Cargo.toml` | 崩溃/强杀兜底改动后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `cargo check --manifest-path src-tauri\Cargo.toml` | 崩溃/强杀兜底改动后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run build` | 崩溃/强杀兜底改动后 | 前端构建仍通过 | 构建通过；仅有 npm 版本提示 | 通过 |
+| `git diff --check` | 崩溃/强杀兜底改动后 | 无空白错误 | 通过，仅有 CRLF 提示 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -343,15 +385,17 @@
 | 2026-09-10 | 删除和快速输入仍成块 | 1 | 移除前端输入 debounce 和后端 writer drain，改为按键级低延迟发送 |
 | 2026-09-10 | 需要切回普通 xterm.js 验证 | 1 | 创建 `codex/xterm-js` 分支并回切 xterm.js，保留低延迟串口链路 |
 | 2026-09-10 | 窗口拉伸时终端边缘出现周期性黑色区域 | 1 | 覆盖 xterm 内部默认黑色背景并让 screen 最小铺满 host |
+| 2026-09-14 | 关闭软件时可能残留串口、ADB shell 或 scrcpy 进程 | 1 | 在后端窗口关闭事件中统一 cleanup，并给 SerialManager 增加 Drop 兜底 |
+| 2026-09-14 | 主进程崩溃或被强杀时进程内清理逻辑不会可靠执行 | 1 | 使用 Windows Job Object 的 `KILL_ON_JOB_CLOSE` 托管 scrcpy 和 ADB Shell 子进程，串口由系统关闭 HANDLE |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 16：修复窗口拉伸时终端黑边 |
-| 我要去哪里？ | 提交本轮 resize 视觉修复，并等待用户实机复测 |
+| 我在哪里？ | 完成阶段 18：崩溃/强杀时清理 scrcpy 和 ADB shell 子进程兜底 |
+| 我要去哪里？ | 等待用户实机确认强杀主程序时不会残留 scrcpy/ADB shell 子进程 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
-| 我做了什么？ | 建立子项目规划并确定替换终端核心 |
+| 我做了什么？ | 增加 Windows Job Object 托管长生命周期子进程，并保持正常退出 cleanup 不变 |
 
 ---
 *每个阶段完成后或遇到错误时更新此文件*

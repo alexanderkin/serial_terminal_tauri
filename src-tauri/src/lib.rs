@@ -14,10 +14,20 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::os::windows::{io::AsRawHandle, process::CommandExt};
+
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    },
+};
 
 #[cfg(windows)]
 mod windows_serial;
@@ -42,6 +52,14 @@ struct SerialManager {
     inner: Mutex<SerialState>,
 }
 
+impl Drop for SerialManager {
+    fn drop(&mut self) {
+        if let Ok(state) = self.inner.get_mut() {
+            close_locked(state);
+        }
+    }
+}
+
 #[derive(Default)]
 struct SerialState {
     reader_stop: Option<Arc<AtomicBool>>,
@@ -55,14 +73,86 @@ struct AndroidManager {
     scrcpy_processes: Mutex<HashMap<String, Child>>,
     adb_shells: Arc<Mutex<HashMap<String, AdbShellHandle>>>,
     next_adb_shell_id: AtomicU64,
+    #[cfg(windows)]
+    child_cleanup_job: Result<ChildCleanupJob, String>,
 }
 
 impl Default for AndroidManager {
     fn default() -> Self {
+        #[cfg(windows)]
+        let child_cleanup_job = match ChildCleanupJob::new() {
+            Ok(job) => Ok(job),
+            Err(error) => {
+                eprintln!("[serial-terminal] 子进程异常退出清理兜底不可用: {error}");
+                Err(error)
+            }
+        };
+
         Self {
             scrcpy_processes: Mutex::new(HashMap::new()),
             adb_shells: Arc::new(Mutex::new(HashMap::new())),
             next_adb_shell_id: AtomicU64::new(1),
+            #[cfg(windows)]
+            child_cleanup_job,
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ChildCleanupJob {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl ChildCleanupJob {
+    fn new() -> Result<Self, String> {
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle == 0 {
+                return Err(format!(
+                    "创建子进程 Job Object 失败: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let mut limits = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+            let result = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+
+            if result == 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = CloseHandle(handle);
+                return Err(format!("配置子进程 Job Object 失败: {error}"));
+            }
+
+            Ok(Self { handle })
+        }
+    }
+
+    fn assign(&self, child: &Child) -> Result<(), String> {
+        let process_handle = child.as_raw_handle() as HANDLE;
+        let result = unsafe { AssignProcessToJobObject(self.handle, process_handle) };
+        if result == 0 {
+            return Err(format!(
+                "将子进程加入 Job Object 失败: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildCleanupJob {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
         }
     }
 }
@@ -76,12 +166,7 @@ struct AdbShellHandle {
 
 impl Drop for AndroidManager {
     fn drop(&mut self) {
-        if let Ok(processes) = self.scrcpy_processes.get_mut() {
-            stop_all_scrcpy_locked(processes);
-        }
-        if let Ok(mut shells) = self.adb_shells.lock() {
-            stop_all_adb_shells_locked(&mut shells);
-        }
+        close_android_manager(self);
     }
 }
 
@@ -229,11 +314,7 @@ fn open_serial_pair(
 
 #[tauri::command]
 fn disconnect(manager: State<'_, SerialManager>) -> Result<(), String> {
-    let mut state = manager
-        .inner
-        .lock()
-        .map_err(|_| "串口状态锁已损坏".to_string())?;
-    close_locked(&mut state);
+    close_serial_manager(&manager)?;
     Ok(())
 }
 
@@ -353,6 +434,7 @@ fn start_scrcpy(
             scrcpy_path.to_string_lossy()
         )
     })?;
+    assign_child_to_cleanup_job(&manager, &mut child, "scrcpy")?;
 
     thread::sleep(Duration::from_millis(150));
     if let Ok(Some(status)) = child.try_wait() {
@@ -431,6 +513,7 @@ fn start_adb_shell(
             adb_path.to_string_lossy()
         )
     })?;
+    assign_child_to_cleanup_job(&manager, &mut child, "ADB Shell")?;
 
     let stdin = child
         .stdin
@@ -1241,6 +1324,68 @@ fn stop_all_adb_shells_locked(sessions: &mut HashMap<String, AdbShellHandle>) {
     sessions.clear();
 }
 
+fn assign_child_to_cleanup_job(
+    manager: &AndroidManager,
+    child: &mut Child,
+    label: &str,
+) -> Result<(), String> {
+    match try_assign_child_to_cleanup_job(manager, child) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            terminate_child_with_timeout(
+                child,
+                Duration::from_millis(PROCESS_TERMINATE_TIMEOUT_MS),
+            );
+            Err(format!("{label} 异常退出清理兜底初始化失败: {error}"))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_assign_child_to_cleanup_job(manager: &AndroidManager, child: &Child) -> Result<(), String> {
+    match &manager.child_cleanup_job {
+        Ok(job) => job.assign(child),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+#[cfg(not(windows))]
+fn try_assign_child_to_cleanup_job(
+    _manager: &AndroidManager,
+    _child: &Child,
+) -> Result<(), String> {
+    Ok(())
+}
+
+fn close_serial_manager(manager: &SerialManager) -> Result<(), String> {
+    let mut state = manager
+        .inner
+        .lock()
+        .map_err(|_| "串口状态锁已损坏".to_string())?;
+    close_locked(&mut state);
+    Ok(())
+}
+
+fn close_android_manager(manager: &AndroidManager) {
+    if let Ok(mut processes) = manager.scrcpy_processes.lock() {
+        stop_all_scrcpy_locked(&mut processes);
+    }
+    if let Ok(mut shells) = manager.adb_shells.lock() {
+        stop_all_adb_shells_locked(&mut shells);
+    }
+}
+
+fn cleanup_runtime_resources(serial_manager: &SerialManager, android_manager: &AndroidManager) {
+    let _ = close_serial_manager(serial_manager);
+    close_android_manager(android_manager);
+}
+
+fn cleanup_window_resources(window: &tauri::Window) {
+    let serial_manager = window.state::<SerialManager>();
+    let android_manager = window.state::<AndroidManager>();
+    cleanup_runtime_resources(&serial_manager, &android_manager);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1264,6 +1409,11 @@ pub fn run() {
             write_adb_shell,
             stop_adb_shell
         ])
+        .on_window_event(|window, event| {
+            if matches!(event, WindowEvent::CloseRequested { .. }) {
+                cleanup_window_resources(window);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
