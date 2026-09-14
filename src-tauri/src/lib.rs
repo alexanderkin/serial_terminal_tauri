@@ -6,9 +6,9 @@ use std::{
     env,
     io::{ErrorKind, Read, Write},
     path::PathBuf,
-    process::{Child, Command, Output},
+    process::{Child, ChildStdin, Command, Output, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -46,15 +46,36 @@ struct SerialState {
     writer: Option<JoinHandle<()>>,
 }
 
-#[derive(Default)]
 struct AndroidManager {
     scrcpy_processes: Mutex<HashMap<String, Child>>,
+    adb_shells: Arc<Mutex<HashMap<String, AdbShellHandle>>>,
+    next_adb_shell_id: AtomicU64,
+}
+
+impl Default for AndroidManager {
+    fn default() -> Self {
+        Self {
+            scrcpy_processes: Mutex::new(HashMap::new()),
+            adb_shells: Arc::new(Mutex::new(HashMap::new())),
+            next_adb_shell_id: AtomicU64::new(1),
+        }
+    }
+}
+
+struct AdbShellHandle {
+    shell_id: u64,
+    stdin_tx: mpsc::Sender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Child>>,
 }
 
 impl Drop for AndroidManager {
     fn drop(&mut self) {
         if let Ok(processes) = self.scrcpy_processes.get_mut() {
             stop_all_scrcpy_locked(processes);
+        }
+        if let Ok(mut shells) = self.adb_shells.lock() {
+            stop_all_adb_shells_locked(&mut shells);
         }
     }
 }
@@ -102,6 +123,27 @@ struct AndroidState {
 struct ScrcpyOptions {
     video_codec: String,
     video_bit_rate: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AdbShellData {
+    device_id: String,
+    shell_id: u64,
+    data: String,
+    byte_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AdbShellExit {
+    device_id: String,
+    shell_id: u64,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AdbShellStart {
+    device_id: String,
+    shell_id: u64,
 }
 
 #[tauri::command]
@@ -337,6 +379,257 @@ fn stop_scrcpy(manager: State<'_, AndroidManager>, device_id: String) -> Result<
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn start_adb_shell(
+    app: AppHandle,
+    manager: State<'_, AndroidManager>,
+    device_id: String,
+) -> Result<AdbShellStart, String> {
+    let device_id = normalize_device_id(&device_id)?;
+    let shells = Arc::clone(&manager.adb_shells);
+
+    {
+        let mut sessions = shells
+            .lock()
+            .map_err(|_| "ADB Shell 状态锁已损坏".to_string())?;
+        cleanup_adb_shells_locked(&mut sessions);
+        if let Some(handle) = sessions.get(&device_id) {
+            return Ok(AdbShellStart {
+                device_id,
+                shell_id: handle.shell_id,
+            });
+        }
+    }
+
+    let adb_path = find_tool_path("adb")?;
+    let mut command = Command::new(&adb_path);
+    if let Some(adb_dir) = adb_path.parent() {
+        command.current_dir(adb_dir);
+    }
+    command
+        .arg("-s")
+        .arg(&device_id)
+        .arg("shell")
+        .arg("-tt")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_command_window(&mut command);
+
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "启动 ADB Shell 失败: {error} ({})",
+            adb_path.to_string_lossy()
+        )
+    })?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "创建 ADB Shell 输入通道失败".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "创建 ADB Shell 输出通道失败".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "创建 ADB Shell 错误输出通道失败".to_string())?;
+
+    let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let shell_id = manager.next_adb_shell_id.fetch_add(1, Ordering::Relaxed);
+    let child = Arc::new(Mutex::new(child));
+    let handle = AdbShellHandle {
+        shell_id,
+        stdin_tx,
+        stop: Arc::clone(&stop),
+        child: Arc::clone(&child),
+    };
+
+    {
+        let mut sessions = shells
+            .lock()
+            .map_err(|_| "ADB Shell 状态锁已损坏".to_string())?;
+        sessions.insert(device_id.clone(), handle);
+    }
+
+    spawn_adb_shell_writer(stdin, stdin_rx, Arc::clone(&stop));
+    spawn_adb_shell_reader(app.clone(), device_id.clone(), shell_id, stdout);
+    spawn_adb_shell_reader(app.clone(), device_id.clone(), shell_id, stderr);
+    spawn_adb_shell_monitor(app, shells, device_id.clone(), shell_id, child, stop);
+
+    Ok(AdbShellStart {
+        device_id,
+        shell_id,
+    })
+}
+
+#[tauri::command]
+fn write_adb_shell(
+    manager: State<'_, AndroidManager>,
+    device_id: String,
+    text: String,
+) -> Result<(), String> {
+    let device_id = normalize_device_id(&device_id)?;
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let sessions = manager
+        .adb_shells
+        .lock()
+        .map_err(|_| "ADB Shell 状态锁已损坏".to_string())?;
+    let handle = sessions
+        .get(&device_id)
+        .ok_or_else(|| format!("ADB Shell 未打开: {device_id}"))?;
+    if handle.stop.load(Ordering::Relaxed) {
+        return Err(format!("ADB Shell 已关闭: {device_id}"));
+    }
+
+    handle
+        .stdin_tx
+        .send(text.into_bytes())
+        .map_err(|_| format!("ADB Shell 输入通道已关闭: {device_id}"))
+}
+
+#[tauri::command]
+fn stop_adb_shell(manager: State<'_, AndroidManager>, device_id: String) -> Result<(), String> {
+    let device_id = normalize_device_id(&device_id)?;
+    let handle = {
+        let mut sessions = manager
+            .adb_shells
+            .lock()
+            .map_err(|_| "ADB Shell 状态锁已损坏".to_string())?;
+        cleanup_adb_shells_locked(&mut sessions);
+        sessions.remove(&device_id)
+    };
+
+    if let Some(handle) = handle {
+        stop_adb_shell_handle(&handle);
+    }
+
+    Ok(())
+}
+
+fn spawn_adb_shell_writer(
+    mut stdin: ChildStdin,
+    stdin_rx: mpsc::Receiver<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let Ok(bytes) = stdin_rx.recv() else {
+                break;
+            };
+
+            if bytes.is_empty() {
+                continue;
+            }
+
+            if stdin.write_all(&bytes).is_err() {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+
+            if stdin.flush().is_err() {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_adb_shell_reader<R>(app: AppHandle, device_id: String, shell_id: u64, mut reader: R)
+where
+    R: Read + Send + 'static,
+{
+    let _ = thread::spawn(move || {
+        let mut buffer = [0_u8; SERIAL_READ_BUFFER_SIZE];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(byte_count) => {
+                    emit_adb_shell_data(&app, &device_id, shell_id, &buffer[..byte_count]);
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn spawn_adb_shell_monitor(
+    app: AppHandle,
+    sessions: Arc<Mutex<HashMap<String, AdbShellHandle>>>,
+    device_id: String,
+    shell_id: u64,
+    child: Arc<Mutex<Child>>,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = thread::spawn(move || {
+        let mut stopped_by_request = false;
+        let message = loop {
+            if stop.load(Ordering::Relaxed) {
+                stopped_by_request = true;
+                if let Ok(mut child) = child.lock() {
+                    let _ = child.kill();
+                }
+            }
+
+            let status = match child.lock() {
+                Ok(mut child) => child.try_wait(),
+                Err(_) => break "ADB Shell 状态锁已损坏".to_string(),
+            };
+
+            match status {
+                Ok(Some(status)) => {
+                    if stopped_by_request || stop.load(Ordering::Relaxed) {
+                        break "ADB Shell 已关闭".to_string();
+                    }
+                    break format!("ADB Shell 已退出: {status}");
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(150)),
+                Err(error) => break format!("ADB Shell 状态检查失败: {error}"),
+            }
+        };
+
+        stop.store(true, Ordering::Relaxed);
+        if let Ok(mut sessions) = sessions.lock() {
+            if sessions
+                .get(&device_id)
+                .is_some_and(|handle| handle.shell_id == shell_id)
+            {
+                sessions.remove(&device_id);
+            }
+        }
+        let _ = app.emit(
+            "adb-shell-exit",
+            AdbShellExit {
+                device_id,
+                shell_id,
+                message,
+            },
+        );
+    });
+}
+
+fn emit_adb_shell_data(app: &AppHandle, device_id: &str, shell_id: u64, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let _ = app.emit(
+        "adb-shell-data",
+        AdbShellData {
+            device_id: device_id.to_string(),
+            shell_id,
+            data: BASE64_STANDARD.encode(bytes),
+            byte_count: bytes.len() as u64,
+        },
+    );
 }
 
 fn spawn_reader<R>(app: AppHandle, mut port: R, reader_stop: Arc<AtomicBool>) -> JoinHandle<()>
@@ -804,6 +1097,33 @@ fn stop_all_scrcpy_locked(processes: &mut HashMap<String, Child>) {
     processes.clear();
 }
 
+fn cleanup_adb_shells_locked(sessions: &mut HashMap<String, AdbShellHandle>) {
+    sessions.retain(|_, handle| {
+        if handle.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        match handle.child.lock() {
+            Ok(mut child) => matches!(child.try_wait(), Ok(None)),
+            Err(_) => false,
+        }
+    });
+}
+
+fn stop_adb_shell_handle(handle: &AdbShellHandle) {
+    handle.stop.store(true, Ordering::Relaxed);
+    if let Ok(mut child) = handle.child.lock() {
+        let _ = child.kill();
+    }
+}
+
+fn stop_all_adb_shells_locked(sessions: &mut HashMap<String, AdbShellHandle>) {
+    for handle in sessions.values() {
+        stop_adb_shell_handle(handle);
+    }
+    sessions.clear();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -822,7 +1142,10 @@ pub fn run() {
             list_adb_state,
             list_scrcpy_devices,
             start_scrcpy,
-            stop_scrcpy
+            stop_scrcpy,
+            start_adb_shell,
+            write_adb_shell,
+            stop_adb_shell
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

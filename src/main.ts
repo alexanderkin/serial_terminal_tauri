@@ -19,6 +19,7 @@ type PickerId =
   | "scrcpyCodec";
 type ScrcpyVideoCodec = "h264" | "h265" | "av1";
 type TerminalContextMenuAction = "copy" | "paste" | "clear";
+type TerminalSessionKind = "serial" | "adbShell";
 type ResizeDirection =
   | "North"
   | "South"
@@ -42,6 +43,22 @@ interface TerminalContextMenuState {
   top: number;
   canCopy: boolean;
   canPaste: boolean;
+}
+
+interface TerminalSession {
+  id: string;
+  kind: TerminalSessionKind;
+  title: string;
+  deviceId?: string;
+  shellId?: number;
+  terminal: Terminal;
+  fitAddon: FitAddon;
+  inputDisposable: { dispose(): void };
+  pendingOutput: Uint8Array[];
+  pendingOutputIndex: number;
+  pendingOutputBytes: number;
+  outputWriting: boolean;
+  closed: boolean;
 }
 
 interface SerialConfig {
@@ -77,6 +94,24 @@ interface AndroidStatePayload {
   scrcpy_devices: string[];
 }
 
+interface AdbShellDataPayload {
+  device_id: string;
+  shell_id: number;
+  data: string;
+  byte_count: number;
+}
+
+interface AdbShellExitPayload {
+  device_id: string;
+  shell_id: number;
+  message: string;
+}
+
+interface AdbShellStartPayload {
+  device_id: string;
+  shell_id: number;
+}
+
 interface ScrcpyOptions {
   video_codec: ScrcpyVideoCodec;
   video_bit_rate: string;
@@ -105,6 +140,9 @@ interface AppState {
   scrcpySessionOptions: Record<string, ScrcpyOptions>;
   adbBusy: boolean;
   scrcpyBusy: boolean;
+  adbShellBusy: boolean;
+  activeTerminalId: string;
+  adbShellDevices: string[];
   androidMessage: string;
   androidError: string;
 }
@@ -147,6 +185,7 @@ const storageKey = "serial-terminal-settings-v1";
 const defaultScrcpyBitRate = "8M";
 const adbStateRefreshIntervalMs = 5000;
 const scrcpyStateRefreshIntervalMs = 800;
+const serialTerminalId = "serial";
 const serialWriteChunkSize = 64;
 const serialWriteMaxChunksPerPump = 4;
 const serialWriteMaxInFlight = 8;
@@ -188,6 +227,9 @@ const state: AppState = {
   scrcpySessionOptions: {},
   adbBusy: false,
   scrcpyBusy: false,
+  adbShellBusy: false,
+  activeTerminalId: serialTerminalId,
+  adbShellDevices: [],
   androidMessage: "",
   androidError: "",
 };
@@ -199,68 +241,18 @@ if (!appRoot) {
 const app: HTMLDivElement = appRoot;
 const currentWindow = getCurrentWindow();
 
-const fitAddon = new FitAddon();
-const terminal = new Terminal({
-  allowTransparency: false,
-  convertEol: false,
-  cursorBlink: true,
-  cursorStyle: "bar",
-  disableStdin: false,
-  fontFamily: terminalFontFamily(),
-  fontSize: state.fontSize,
-  lineHeight: state.lineSpacing,
-  rightClickSelectsWord: false,
-  scrollback: 10000,
-  smoothScrollDuration: 0,
-  theme: {
-    background: "#1E1E2E",
-    foreground: "#CDD6F4",
-    cursor: "#F5E0DC",
-    cursorAccent: "#1E1E2E",
-    selectionBackground: "#585B70",
-    black: "#45475A",
-    red: "#F38BA8",
-    green: "#A6E3A1",
-    yellow: "#F9E2AF",
-    blue: "#89B4FA",
-    magenta: "#F5C2E7",
-    cyan: "#94E2D5",
-    white: "#BAC2DE",
-    brightBlack: "#585B70",
-    brightRed: "#F38BA8",
-    brightGreen: "#A6E3A1",
-    brightYellow: "#F9E2AF",
-    brightBlue: "#89B4FA",
-    brightMagenta: "#F5C2E7",
-    brightCyan: "#94E2D5",
-    brightWhite: "#A6ADC8",
-  },
-});
-
-terminal.loadAddon(fitAddon);
-terminal.attachCustomKeyEventHandler((event) => {
-  if (event.type === "keydown" && event.ctrlKey && event.key.toLowerCase() === "c") {
-    if (terminal.hasSelection()) {
-      copySelection(true);
-      return false;
-    }
-  }
-
-  return true;
-});
+const terminalSessions = new Map<string, TerminalSession>();
+const serialSession = createTerminalSession(serialTerminalId, "serial", "串口终端");
+const terminal = serialSession.terminal;
+const closingAdbShellDevices = new Set<string>();
 
 let terminalHost: HTMLDivElement | null = null;
-let terminalInputDisposable: { dispose(): void } | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let fitQueued = false;
 let pendingSerialText = "";
 let serialWritePumpQueued = false;
 let serialWritePumpTimer: number | null = null;
 let serialWritesInFlight = 0;
-let pendingTerminalOutput: Uint8Array[] = [];
-let pendingTerminalOutputIndex = 0;
-let pendingTerminalOutputBytes = 0;
-let terminalOutputWriting = false;
 let terminalContextMenu: TerminalContextMenuState | null = null;
 let pendingStatsUpdate = false;
 let lastPerfReportAt = 0;
@@ -305,17 +297,8 @@ function renderApp(): void {
           <div class="brand-title">Serial Terminal</div>
           <div class="brand-subtitle">Rust · Tauri · 串口终端</div>
         </div>
-        <div class="terminal-hint">聚焦终端直接输入 · Enter=CR · Ctrl+C=中断</div>
-        <div class="topbar-actions">
-          <span id="rx-stat" class="metric">RX ${formatBytes(state.rxBytes)}</span>
-          <span id="tx-stat" class="metric">TX ${formatBytes(state.txBytes)}</span>
-          <button id="copy-terminal" class="ghost-button" type="button">复制</button>
-          <button id="clear-terminal" class="ghost-button" type="button">清空</button>
-          <div class="status-pill ${statusTone()}">
-            <span class="status-dot"></span>
-            <span>${statusText()}</span>
-          </div>
-        </div>
+        ${renderTerminalTabs()}
+        ${renderTopbarStats()}
       </header>
 
       <main class="workspace">
@@ -518,10 +501,264 @@ function renderAndroidSections(): string {
       >
         ${scrcpyButtonText()}
       </button>
+      <button
+        id="adb-shell-open"
+        class="secondary-button full-button ${isAdbShellRunning(state.selectedAdbDevice) ? "danger-button" : ""}"
+        type="button"
+        ${state.adbShellBusy || !canOpenAdbShell() ? "disabled" : ""}
+      >
+        ${adbShellButtonText()}
+      </button>
       ${state.androidMessage ? `<div class="helper-text">${escapeHtml(state.androidMessage)}</div>` : ""}
       ${state.androidError ? `<div class="error-text">${escapeHtml(state.androidError)}</div>` : ""}
     </section>
   `;
+}
+
+function createTerminalSession(
+  id: string,
+  kind: TerminalSessionKind,
+  title: string,
+  deviceId?: string,
+): TerminalSession {
+  const sessionTerminal = new Terminal({
+    allowTransparency: false,
+    convertEol: false,
+    cursorBlink: true,
+    cursorStyle: "bar",
+    disableStdin: false,
+    fontFamily: terminalFontFamily(),
+    fontSize: state.fontSize,
+    lineHeight: state.lineSpacing,
+    rightClickSelectsWord: false,
+    scrollback: 10000,
+    smoothScrollDuration: 0,
+    theme: terminalTheme(),
+  });
+  const sessionFitAddon = new FitAddon();
+  const session: TerminalSession = {
+    id,
+    kind,
+    title,
+    deviceId,
+    terminal: sessionTerminal,
+    fitAddon: sessionFitAddon,
+    inputDisposable: { dispose: () => {} },
+    pendingOutput: [],
+    pendingOutputIndex: 0,
+    pendingOutputBytes: 0,
+    outputWriting: false,
+    closed: false,
+  };
+
+  sessionTerminal.loadAddon(sessionFitAddon);
+  sessionTerminal.attachCustomKeyEventHandler((event) => {
+    if (event.type === "keydown" && event.ctrlKey && event.key.toLowerCase() === "c") {
+      if (sessionTerminal.hasSelection()) {
+        copyTerminalSelection(sessionTerminal, true);
+        return false;
+      }
+    }
+
+    return true;
+  });
+  session.inputDisposable = sessionTerminal.onData((data) => {
+    if (session.kind === "serial") {
+      queueSerialText(normalizeTerminalInput(data));
+      return;
+    }
+
+    if (session.deviceId && !session.closed) {
+      queueTerminalText(session, data);
+    }
+  });
+
+  terminalSessions.set(id, session);
+  return session;
+}
+
+function terminalTheme(): NonNullable<ConstructorParameters<typeof Terminal>[0]>["theme"] {
+  return {
+    background: "#1E1E2E",
+    foreground: "#CDD6F4",
+    cursor: "#F5E0DC",
+    cursorAccent: "#1E1E2E",
+    selectionBackground: "#585B70",
+    black: "#45475A",
+    red: "#F38BA8",
+    green: "#A6E3A1",
+    yellow: "#F9E2AF",
+    blue: "#89B4FA",
+    magenta: "#F5C2E7",
+    cyan: "#94E2D5",
+    white: "#BAC2DE",
+    brightBlack: "#585B70",
+    brightRed: "#F38BA8",
+    brightGreen: "#A6E3A1",
+    brightYellow: "#F9E2AF",
+    brightBlue: "#89B4FA",
+    brightMagenta: "#F5C2E7",
+    brightCyan: "#94E2D5",
+    brightWhite: "#A6ADC8",
+  };
+}
+
+function renderTerminalTabs(): string {
+  return `
+    <div class="terminal-tabs" role="tablist" aria-label="终端标签">
+      ${Array.from(terminalSessions.values()).map(renderTerminalTab).join("")}
+    </div>
+  `;
+}
+
+function renderTopbarStats(): string {
+  if (activeTerminalSession().kind !== "serial") {
+    return `<div class="topbar-actions" aria-hidden="true"></div>`;
+  }
+
+  return `
+    <div class="topbar-actions">
+      <span id="rx-stat" class="metric">RX ${formatBytes(state.rxBytes)}</span>
+      <span id="tx-stat" class="metric">TX ${formatBytes(state.txBytes)}</span>
+    </div>
+  `;
+}
+
+function renderTerminalTab(session: TerminalSession): string {
+  const active = activeTerminalSession().id === session.id;
+  const tone = terminalSessionTone(session);
+  return `
+    <button
+      class="terminal-tab ${active ? "active" : ""} ${session.closed ? "closed" : ""}"
+      type="button"
+      role="tab"
+      aria-selected="${active ? "true" : "false"}"
+      data-terminal-tab-id="${escapeAttribute(session.id)}"
+      title="${escapeAttribute(session.title)}"
+    >
+      <span class="small-dot ${tone}"></span>
+      <span class="terminal-tab-label">${escapeHtml(session.title)}</span>
+      ${
+        session.kind === "adbShell" && session.deviceId
+          ? `<span class="terminal-tab-close" data-adb-shell-close-device="${escapeAttribute(session.deviceId)}" title="关闭 ADB Shell">×</span>`
+          : ""
+      }
+    </button>
+  `;
+}
+
+function terminalSessionTone(session: TerminalSession): string {
+  if (session.kind === "serial") {
+    return statusTone();
+  }
+
+  if (session.closed) {
+    return "disconnected";
+  }
+
+  return session.deviceId && isAdbShellRunning(session.deviceId) ? "connected" : "warning";
+}
+
+function bindTerminalTabEvents(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-terminal-tab-id]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      const closeTarget = (event.target as Element | null)?.closest<HTMLElement>(
+        "[data-adb-shell-close-device]",
+      );
+      if (closeTarget?.dataset.adbShellCloseDevice) {
+        event.preventDefault();
+        event.stopPropagation();
+        void closeAdbShellTab(closeTarget.dataset.adbShellCloseDevice);
+        return;
+      }
+
+      const tabId = button.dataset.terminalTabId;
+      if (tabId) {
+        activateTerminalTab(tabId);
+      }
+    });
+  });
+}
+
+function activateTerminalTab(id: string): void {
+  if (!terminalSessions.has(id)) {
+    return;
+  }
+
+  state.activeTerminalId = id;
+  closeTerminalContextMenu();
+  renderApp();
+}
+
+function activeTerminalSession(): TerminalSession {
+  return terminalSessions.get(state.activeTerminalId) ?? serialSession;
+}
+
+function activeTerminal(): Terminal {
+  return activeTerminalSession().terminal;
+}
+
+function focusActiveTerminal(): void {
+  activeTerminal().focus();
+}
+
+function adbShellTerminalId(deviceId: string): string {
+  return `adb-shell:${deviceId}`;
+}
+
+function adbShellTitle(deviceId: string, closed = false): string {
+  return `ADB Shell · ${deviceId}${closed ? " · 已退出" : ""}`;
+}
+
+function ensureAdbShellSession(
+  deviceId: string,
+  activate = false,
+  markRunning = true,
+  shellId?: number,
+): TerminalSession {
+  const id = adbShellTerminalId(deviceId);
+  let session = terminalSessions.get(id);
+  if (!session) {
+    session = createTerminalSession(id, "adbShell", adbShellTitle(deviceId), deviceId);
+  } else {
+    session.closed = false;
+    session.title = adbShellTitle(deviceId);
+  }
+
+  if (typeof shellId === "number") {
+    session.shellId = shellId;
+  } else if (!markRunning) {
+    session.shellId = undefined;
+  }
+
+  if (markRunning && !state.adbShellDevices.includes(deviceId)) {
+    state.adbShellDevices = [...state.adbShellDevices, deviceId].sort();
+  }
+
+  if (activate) {
+    state.activeTerminalId = id;
+  }
+
+  return session;
+}
+
+function canPasteToTerminal(session: TerminalSession): boolean {
+  if (session.kind === "serial") {
+    return state.mode === "connected";
+  }
+
+  return !!session.deviceId && !session.closed && isAdbShellRunning(session.deviceId);
+}
+
+function queueTerminalText(session: TerminalSession, text: string): void {
+  if (session.kind === "serial") {
+    queueSerialText(text);
+    return;
+  }
+
+  if (session.deviceId) {
+    queueAdbShellText(session.deviceId, normalizeAdbShellInput(text));
+  }
 }
 
 function attachTerminal(): void {
@@ -530,11 +767,12 @@ function attachTerminal(): void {
     return;
   }
 
-  if (host !== terminalHost || terminal.element?.parentElement !== host) {
-    if (terminal.element) {
-      host.replaceChildren(terminal.element);
+  const session = activeTerminalSession();
+  if (host !== terminalHost || session.terminal.element?.parentElement !== host) {
+    if (session.terminal.element) {
+      host.replaceChildren(session.terminal.element);
     } else {
-      terminal.open(host);
+      session.terminal.open(host);
     }
     terminalHost = host;
 
@@ -551,13 +789,7 @@ function attachTerminal(): void {
     }, { capture: true });
   }
 
-  if (!terminalInputDisposable) {
-    terminalInputDisposable = terminal.onData((data) => {
-      queueSerialText(normalizeTerminalInput(data));
-    });
-  }
-
-  terminal.focus();
+  session.terminal.focus();
   queueFit();
 }
 
@@ -572,15 +804,6 @@ function bindChromeEvents(): void {
     void toggleConnection();
   });
 
-  document.querySelector("#copy-terminal")?.addEventListener("click", () => {
-    copySelection();
-  });
-
-  document.querySelector("#clear-terminal")?.addEventListener("click", () => {
-    terminal.clear();
-    terminal.focus();
-  });
-
   document.querySelectorAll<HTMLButtonElement>('[data-terminal-menu-action]').forEach((button) => {
     button.addEventListener("click", () => {
       const action = button.dataset.terminalMenuAction as TerminalContextMenuAction | undefined;
@@ -593,6 +816,7 @@ function bindChromeEvents(): void {
 
   bindPickerEvents();
   bindAndroidEvents();
+  bindTerminalTabEvents();
 
   const fontSize = document.querySelector<HTMLInputElement>("#font-size");
   fontSize?.addEventListener("input", () => {
@@ -656,6 +880,10 @@ function bindAndroidEvents(): void {
   document.querySelector("#scrcpy-toggle")?.addEventListener("click", () => {
     void toggleScrcpy();
   });
+
+  document.querySelector("#adb-shell-open")?.addEventListener("click", () => {
+    void toggleAdbShell();
+  });
 }
 
 function renderTerminalContextMenu(): string {
@@ -698,14 +926,15 @@ function renderTerminalContextMenu(): string {
 
 function openTerminalContextMenu(clientX: number, clientY: number): void {
   const menuSize = terminalContextMenuSize();
+  const session = activeTerminalSession();
   terminalContextMenu = {
     left: clamp(clientX, terminalMenuMargin, window.innerWidth - menuSize.width - terminalMenuMargin),
     top: clamp(clientY, terminalMenuMargin, window.innerHeight - menuSize.height - terminalMenuMargin),
-    canCopy: terminal.hasSelection(),
-    canPaste: state.mode === "connected",
+    canCopy: session.terminal.hasSelection(),
+    canPaste: canPasteToTerminal(session),
   };
   renderApp();
-  terminal.focus();
+  focusActiveTerminal();
 }
 
 function closeTerminalContextMenu(): boolean {
@@ -732,13 +961,13 @@ function terminalContextMenuSize(): { width: number; height: number } {
 
 async function runTerminalContextMenuAction(action: TerminalContextMenuAction): Promise<void> {
   if (action === "copy") {
-    const selection = terminal.getSelection();
+    const selection = activeTerminal().getSelection();
     closeTerminalContextMenu();
     renderApp();
     if (selection.length > 0) {
       void navigator.clipboard.writeText(selection);
     }
-    terminal.focus();
+    focusActiveTerminal();
     return;
   }
 
@@ -751,24 +980,25 @@ async function runTerminalContextMenuAction(action: TerminalContextMenuAction): 
 
   closeTerminalContextMenu();
   renderApp();
-  terminal.clear();
-  terminal.focus();
+  activeTerminal().clear();
+  focusActiveTerminal();
 }
 
 async function pasteFromClipboard(): Promise<void> {
-  if (state.mode !== "connected") {
+  const session = activeTerminalSession();
+  if (!canPasteToTerminal(session)) {
     return;
   }
 
   try {
     const text = await navigator.clipboard.readText();
     if (text.length > 0) {
-      queueSerialText(normalizePastedText(text));
+      queueTerminalText(session, normalizePastedText(text));
     }
   } catch (error) {
-    terminal.writeln(`\x1b[31m读取剪贴板失败: ${toMessage(error)}\x1b[0m`);
+    session.terminal.writeln(`\x1b[31m读取剪贴板失败: ${toMessage(error)}\x1b[0m`);
   } finally {
-    terminal.focus();
+    session.terminal.focus();
   }
 }
 
@@ -1123,11 +1353,13 @@ function calculatePickerPosition(button: HTMLElement, optionCount: number): Drop
 }
 
 function applyTerminalOptions(): void {
-  terminal.options.fontFamily = terminalFontFamily();
-  terminal.options.fontSize = state.fontSize;
-  terminal.options.lineHeight = state.lineSpacing;
+  for (const session of terminalSessions.values()) {
+    session.terminal.options.fontFamily = terminalFontFamily();
+    session.terminal.options.fontSize = state.fontSize;
+    session.terminal.options.lineHeight = state.lineSpacing;
+  }
   queueFit();
-  terminal.focus();
+  focusActiveTerminal();
 }
 
 async function refreshPorts(): Promise<void> {
@@ -1314,6 +1546,147 @@ async function toggleScrcpy(): Promise<void> {
   renderApp();
 }
 
+async function toggleAdbShell(): Promise<void> {
+  const deviceId = state.selectedAdbDevice;
+  if (deviceId && isAdbShellRunning(deviceId)) {
+    await closeAdbShellTab(deviceId);
+    return;
+  }
+
+  await openAdbShell();
+}
+
+async function openAdbShell(): Promise<void> {
+  const deviceId = state.selectedAdbDevice;
+  if (!deviceId) {
+    state.androidError = "请选择一个 ADB 设备";
+    renderApp();
+    return;
+  }
+
+  if (!canOpenAdbShell()) {
+    state.androidError = "当前 ADB 设备不可用";
+    renderApp();
+    return;
+  }
+
+  state.adbShellBusy = true;
+  state.androidError = "";
+  state.androidMessage = "";
+  closingAdbShellDevices.delete(deviceId);
+  const session = ensureAdbShellSession(deviceId, true, false);
+  session.terminal.clear();
+  renderApp();
+
+  try {
+    const result = await invoke<AdbShellStartPayload>("start_adb_shell", { deviceId });
+    const activeShell = ensureAdbShellSession(result.device_id, true, true, result.shell_id);
+    activeShell.terminal.writeln(`\x1b[32mADB Shell 已打开: ${result.device_id}\x1b[0m`);
+    state.androidMessage = `已打开 ADB Shell: ${result.device_id}`;
+  } catch (error) {
+    state.androidError = toMessage(error);
+    removeAdbShellSession(deviceId);
+  } finally {
+    state.adbShellBusy = false;
+  }
+
+  renderApp();
+}
+
+async function closeAdbShellTab(deviceId: string): Promise<void> {
+  const running = isAdbShellRunning(deviceId);
+  closingAdbShellDevices.add(deviceId);
+  removeAdbShellSession(deviceId);
+  renderApp();
+
+  if (!running) {
+    closingAdbShellDevices.delete(deviceId);
+    return;
+  }
+
+  try {
+    await invoke<void>("stop_adb_shell", { deviceId });
+  } catch (error) {
+    state.androidError = toMessage(error);
+    renderApp();
+  }
+}
+
+function removeAdbShellSession(deviceId: string): void {
+  const id = adbShellTerminalId(deviceId);
+  const session = terminalSessions.get(id);
+  if (session) {
+    session.inputDisposable.dispose();
+    session.terminal.dispose();
+    terminalSessions.delete(id);
+  }
+
+  state.adbShellDevices = state.adbShellDevices.filter((entry) => entry !== deviceId);
+  if (state.activeTerminalId === id) {
+    state.activeTerminalId = serialTerminalId;
+  }
+}
+
+function handleAdbShellExit(deviceId: string, shellId: number, message: string): void {
+  closingAdbShellDevices.delete(deviceId);
+  const session = terminalSessions.get(adbShellTerminalId(deviceId));
+  if (session?.shellId !== undefined && session.shellId !== shellId) {
+    return;
+  }
+
+  state.adbShellDevices = state.adbShellDevices.filter((entry) => entry !== deviceId);
+  if (session) {
+    session.closed = true;
+    session.shellId = undefined;
+    session.title = adbShellTitle(deviceId, true);
+    session.terminal.writeln(`\r\n\x1b[90m${message}\x1b[0m`);
+  }
+
+  renderApp();
+}
+
+function queueAdbShellOutput(
+  deviceId: string,
+  shellId: number,
+  data: string,
+  byteCount: number,
+): void {
+  if (closingAdbShellDevices.has(deviceId)) {
+    return;
+  }
+
+  const existed = terminalSessions.has(adbShellTerminalId(deviceId));
+  const existingSession = terminalSessions.get(adbShellTerminalId(deviceId));
+  if (existingSession?.shellId !== undefined && existingSession.shellId !== shellId) {
+    return;
+  }
+
+  const session = ensureAdbShellSession(deviceId, false, true, shellId);
+  if (!existed) {
+    renderApp();
+  }
+  queueTerminalOutput(session, data, byteCount);
+}
+
+function queueAdbShellText(deviceId: string, text: string): void {
+  if (!isAdbShellRunning(deviceId) || text.length === 0) {
+    return;
+  }
+
+  void invoke<void>("write_adb_shell", { deviceId, text }).catch((error) => {
+    const message = toMessage(error);
+    const session = terminalSessions.get(adbShellTerminalId(deviceId));
+    if (session) {
+      session.terminal.writeln(`\r\n\x1b[31m${message}\x1b[0m`);
+      session.closed = true;
+      session.title = adbShellTitle(deviceId, true);
+    }
+    state.adbShellDevices = state.adbShellDevices.filter((entry) => entry !== deviceId);
+    state.androidError = message;
+    renderApp();
+  });
+}
+
 function addRemoteAdbHistory(address: string): void {
   const normalized = normalizeRemoteAdbAddress(address);
   if (!normalized) {
@@ -1387,6 +1760,14 @@ function updateAndroidControls(): void {
     scrcpyToggle.disabled = state.scrcpyBusy || !canToggleScrcpy();
     scrcpyToggle.textContent = scrcpyButtonText();
     scrcpyToggle.classList.toggle("connected", running);
+  }
+
+  const adbShellOpen = document.querySelector<HTMLButtonElement>("#adb-shell-open");
+  if (adbShellOpen) {
+    const running = isAdbShellRunning(state.selectedAdbDevice);
+    adbShellOpen.disabled = state.adbShellBusy || !canOpenAdbShell();
+    adbShellOpen.textContent = adbShellButtonText();
+    adbShellOpen.classList.toggle("danger-button", running);
   }
 
   const selectedDeviceStatus = adbDeviceState(state.selectedAdbDevice);
@@ -1554,10 +1935,11 @@ function clearPendingSerialText(): void {
   }
 }
 
-function clearPendingTerminalOutput(): void {
-  pendingTerminalOutput = [];
-  pendingTerminalOutputIndex = 0;
-  pendingTerminalOutputBytes = 0;
+function clearPendingTerminalOutput(session: TerminalSession = serialSession): void {
+  session.pendingOutput = [];
+  session.pendingOutputIndex = 0;
+  session.pendingOutputBytes = 0;
+  session.outputWriting = false;
 }
 
 function normalizeTerminalInput(data: string): string {
@@ -1568,15 +1950,18 @@ function normalizePastedText(text: string): string {
   return text.replace(/\r?\n/g, "\r");
 }
 
-function copySelection(clearAfterCopy = false): void {
-  const selection = terminal.getSelection();
+function normalizeAdbShellInput(data: string): string {
+  return data.replace(/\r/g, "\n");
+}
+
+function copyTerminalSelection(targetTerminal: Terminal, clearAfterCopy = false): void {
+  const selection = targetTerminal.getSelection();
   if (selection.length > 0) {
     void navigator.clipboard.writeText(selection);
     if (clearAfterCopy) {
-      terminal.clearSelection();
+      targetTerminal.clearSelection();
     }
   }
-  terminal.focus();
 }
 
 function updateScale(): void {
@@ -1609,7 +1994,7 @@ function queueFit(): void {
   requestAnimationFrame(() => {
     fitQueued = false;
     try {
-      fitAddon.fit();
+      activeTerminalSession().fitAddon.fit();
     } catch {
       // The fit addon can run before the terminal has completed its first layout pass.
     }
@@ -1662,83 +2047,96 @@ function queueSerialOutput(data: string, byteCount: number): void {
     return;
   }
 
-  if (data.length > 0) {
-    const start = performance.now();
-    const bytes = decodeBase64Bytes(data);
-    const elapsed = performance.now() - start;
-    if (elapsed > perfWarnMs) {
-      reportPerf(`rx base64 decode took ${elapsed.toFixed(1)}ms, bytes=${bytes.byteLength}`);
-    }
-    pendingTerminalOutput.push(bytes);
-    pendingTerminalOutputBytes += bytes.byteLength;
-    drainTerminalOutput();
-  }
+  queueTerminalOutput(serialSession, data, byteCount);
   if (byteCount > 0) {
     state.rxBytes += byteCount;
     requestStatsUpdate();
   }
 }
 
-function drainTerminalOutput(): void {
-  if (terminalOutputWriting || pendingTerminalOutputBytes === 0) {
+function queueTerminalOutput(session: TerminalSession, data: string, byteCount: number): void {
+  if (data.length === 0) {
     return;
   }
 
-  const bytes = takeTerminalOutputChunk();
-  terminalOutputWriting = true;
   const start = performance.now();
-  terminal.write(bytes, () => {
-    terminalOutputWriting = false;
+  const bytes = decodeBase64Bytes(data);
+  const elapsed = performance.now() - start;
+  if (elapsed > perfWarnMs) {
+    reportPerf(`rx base64 decode took ${elapsed.toFixed(1)}ms, bytes=${bytes.byteLength}`);
+  }
+  session.pendingOutput.push(bytes);
+  session.pendingOutputBytes += bytes.byteLength;
+  drainTerminalOutput(session);
+
+  if (byteCount > 0 && byteCount !== bytes.byteLength) {
+    reportPerf(`rx byte count mismatch payload=${bytes.byteLength}, reported=${byteCount}`);
+  }
+}
+
+function drainTerminalOutput(session: TerminalSession): void {
+  if (session.outputWriting || session.pendingOutputBytes === 0) {
+    return;
+  }
+
+  const bytes = takeTerminalOutputChunk(session);
+  session.outputWriting = true;
+  const start = performance.now();
+  session.terminal.write(bytes, () => {
+    session.outputWriting = false;
     const elapsed = performance.now() - start;
     if (elapsed > perfWarnMs) {
       reportPerf(
-        `xterm write took ${elapsed.toFixed(1)}ms, bytes=${bytes.byteLength}, queued=${pendingTerminalOutputBytes}`,
+        `xterm write took ${elapsed.toFixed(1)}ms, bytes=${bytes.byteLength}, queued=${session.pendingOutputBytes}`,
       );
     }
 
-    if (pendingTerminalOutputBytes > 0) {
-      queueMicrotask(drainTerminalOutput);
+    if (session.pendingOutputBytes > 0) {
+      queueMicrotask(() => drainTerminalOutput(session));
     }
   });
 }
 
-function takeTerminalOutputChunk(): Uint8Array {
-  const targetLength = Math.min(pendingTerminalOutputBytes, terminalOutputChunkBytes);
+function takeTerminalOutputChunk(session: TerminalSession): Uint8Array {
+  const targetLength = Math.min(session.pendingOutputBytes, terminalOutputChunkBytes);
   if (
-    pendingTerminalOutputIndex === pendingTerminalOutput.length - 1 &&
-    pendingTerminalOutput[pendingTerminalOutputIndex].byteLength <= targetLength
+    session.pendingOutputIndex === session.pendingOutput.length - 1 &&
+    session.pendingOutput[session.pendingOutputIndex].byteLength <= targetLength
   ) {
-    const onlyChunk = pendingTerminalOutput[pendingTerminalOutputIndex];
-    pendingTerminalOutput = [];
-    pendingTerminalOutputIndex = 0;
-    pendingTerminalOutputBytes = 0;
+    const onlyChunk = session.pendingOutput[session.pendingOutputIndex];
+    session.pendingOutput = [];
+    session.pendingOutputIndex = 0;
+    session.pendingOutputBytes = 0;
     return onlyChunk;
   }
 
   const bytes = new Uint8Array(targetLength);
   let offset = 0;
 
-  while (offset < targetLength && pendingTerminalOutputIndex < pendingTerminalOutput.length) {
-    const chunk = pendingTerminalOutput[pendingTerminalOutputIndex];
+  while (offset < targetLength && session.pendingOutputIndex < session.pendingOutput.length) {
+    const chunk = session.pendingOutput[session.pendingOutputIndex];
     const remaining = targetLength - offset;
 
     if (chunk.byteLength <= remaining) {
       bytes.set(chunk, offset);
       offset += chunk.byteLength;
-      pendingTerminalOutputIndex += 1;
-      pendingTerminalOutputBytes -= chunk.byteLength;
+      session.pendingOutputIndex += 1;
+      session.pendingOutputBytes -= chunk.byteLength;
       continue;
     }
 
     bytes.set(chunk.subarray(0, remaining), offset);
-    pendingTerminalOutput[pendingTerminalOutputIndex] = chunk.subarray(remaining);
-    pendingTerminalOutputBytes -= remaining;
+    session.pendingOutput[session.pendingOutputIndex] = chunk.subarray(remaining);
+    session.pendingOutputBytes -= remaining;
     offset += remaining;
   }
 
-  if (pendingTerminalOutputIndex > 32 && pendingTerminalOutputIndex * 2 > pendingTerminalOutput.length) {
-    pendingTerminalOutput = pendingTerminalOutput.slice(pendingTerminalOutputIndex);
-    pendingTerminalOutputIndex = 0;
+  if (
+    session.pendingOutputIndex > 32 &&
+    session.pendingOutputIndex * 2 > session.pendingOutput.length
+  ) {
+    session.pendingOutput = session.pendingOutput.slice(session.pendingOutputIndex);
+    session.pendingOutputIndex = 0;
   }
 
   return bytes;
@@ -1968,7 +2366,8 @@ function adbDeviceState(deviceId: string): string {
 function adbDeviceDetail(device: AdbDevice): string {
   const source = device.is_remote ? "远程" : "USB";
   const running = state.scrcpyDevices.includes(device.id) ? " · scrcpy 已开" : "";
-  return `${source} · ${adbStateText(device.state)}${running}`;
+  const shell = isAdbShellRunning(device.id) ? " · shell 已开" : "";
+  return `${source} · ${adbStateText(device.state)}${running}${shell}`;
 }
 
 function adbStateText(value: string): string {
@@ -2017,6 +2416,10 @@ function isScrcpyRunning(deviceId: string): boolean {
   return !!deviceId && state.scrcpyDevices.includes(deviceId);
 }
 
+function isAdbShellRunning(deviceId: string): boolean {
+  return !!deviceId && state.adbShellDevices.includes(deviceId);
+}
+
 function scrcpyParametersLocked(): boolean {
   return state.scrcpyBusy || isScrcpyRunning(state.selectedAdbDevice);
 }
@@ -2053,12 +2456,33 @@ function canToggleScrcpy(): boolean {
   return isScrcpyRunning(state.selectedAdbDevice) || adbDeviceState(state.selectedAdbDevice) === "device";
 }
 
+function canOpenAdbShell(): boolean {
+  if (!state.selectedAdbDevice) {
+    return false;
+  }
+
+  return isAdbShellRunning(state.selectedAdbDevice) || adbDeviceState(state.selectedAdbDevice) === "device";
+}
+
 function scrcpyButtonText(): string {
   if (state.scrcpyBusy) {
     return "scrcpy 处理中";
   }
 
   return isScrcpyRunning(state.selectedAdbDevice) ? "断开 scrcpy" : "打开 scrcpy";
+}
+
+function adbShellButtonText(): string {
+  if (state.adbShellBusy) {
+    return "ADB Shell 处理中";
+  }
+
+  if (isAdbShellRunning(state.selectedAdbDevice)) {
+    return "关闭 ADB Shell";
+  }
+
+  const session = terminalSessions.get(adbShellTerminalId(state.selectedAdbDevice));
+  return session?.closed ? "重新打开 ADB Shell" : "打开 ADB Shell";
 }
 
 function scrcpyDetailText(): string {
@@ -2088,19 +2512,6 @@ function statusTone(): string {
     return "error";
   }
   return "disconnected";
-}
-
-function statusText(): string {
-  if (state.mode === "connected") {
-    return `已连接 ${connectionSummaryText()}`;
-  }
-  if (state.mode === "connecting") {
-    return "连接中";
-  }
-  if (state.mode === "error") {
-    return "连接异常";
-  }
-  return "未连接";
 }
 
 function connectionButtonText(): string {
@@ -2189,6 +2600,23 @@ async function setupBackendListeners(): Promise<void> {
     terminal.writeln(`\x1b[31m${event.payload.message}\x1b[0m`);
     void invoke<void>("disconnect");
     renderApp();
+  });
+
+  await listen<AdbShellDataPayload>("adb-shell-data", (event) => {
+    queueAdbShellOutput(
+      event.payload.device_id,
+      event.payload.shell_id,
+      event.payload.data,
+      event.payload.byte_count,
+    );
+  });
+
+  await listen<AdbShellExitPayload>("adb-shell-exit", (event) => {
+    handleAdbShellExit(
+      event.payload.device_id,
+      event.payload.shell_id,
+      event.payload.message,
+    );
   });
 }
 
