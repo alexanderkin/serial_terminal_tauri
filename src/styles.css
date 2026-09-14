@@ -502,6 +502,12 @@ input:disabled {
   margin-bottom: calc(12px * var(--ui-scale));
 }
 
+.scrcpy-action-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: calc(7px * var(--ui-scale));
+}
+
 .compact-field {
   min-width: 0;
   margin-bottom: 0;
@@ -569,10 +575,6 @@ button:focus-visible,
 
 #adb-toggle {
   margin-bottom: calc(8px * var(--ui-scale));
-}
-
-#adb-shell-open {
-  margin-top: calc(8px * var(--ui-scale));
 }
 
 .error-text {

@@ -491,22 +491,24 @@ function renderAndroidSections(): string {
       >
         ${remoteAdbButtonText()}
       </button>
-      <button
-        id="scrcpy-toggle"
-        class="secondary-button full-button ${scrcpyRunning ? "danger-button" : ""}"
-        type="button"
-        ${state.scrcpyBusy || !canToggleScrcpy() ? "disabled" : ""}
-      >
-        ${scrcpyButtonText()}
-      </button>
-      <button
-        id="adb-shell-open"
-        class="secondary-button full-button ${isAdbShellRunning(state.selectedAdbDevice) ? "danger-button" : ""}"
-        type="button"
-        ${state.adbShellBusy || !canOpenAdbShell() ? "disabled" : ""}
-      >
-        ${adbShellButtonText()}
-      </button>
+      <div class="scrcpy-action-row">
+        <button
+          id="scrcpy-toggle"
+          class="secondary-button full-button ${scrcpyRunning ? "danger-button" : ""}"
+          type="button"
+          ${state.scrcpyBusy || !canToggleScrcpy() ? "disabled" : ""}
+        >
+          ${scrcpyButtonText()}
+        </button>
+        <button
+          id="adb-shell-open"
+          class="secondary-button full-button ${isAdbShellRunning(state.selectedAdbDevice) ? "danger-button" : ""}"
+          type="button"
+          ${state.adbShellBusy || !canOpenAdbShell() ? "disabled" : ""}
+        >
+          ${adbShellButtonText()}
+        </button>
+      </div>
       ${state.androidMessage ? `<div class="helper-text">${escapeHtml(state.androidMessage)}</div>` : ""}
       ${state.androidError ? `<div class="error-text">${escapeHtml(state.androidError)}</div>` : ""}
     </section>
@@ -1393,15 +1395,9 @@ async function refreshScrcpyState(shouldRender = false): Promise<void> {
     return;
   }
 
-  const selectedDevice = state.selectedAdbDevice;
-  const selectedWasRunning = isScrcpyRunning(selectedDevice);
-
   try {
     const scrcpyDevices = await invoke<string[]>("list_scrcpy_devices");
     const changed = applyScrcpyDevices(scrcpyDevices);
-    if (changed && selectedDevice && selectedWasRunning && !isScrcpyRunning(selectedDevice)) {
-      state.androidMessage = `scrcpy 已关闭: ${selectedDevice}`;
-    }
 
     if ((shouldRender || changed) && !isTextInputActive()) {
       renderApp();
@@ -1506,7 +1502,6 @@ async function toggleScrcpy(): Promise<void> {
     if (running) {
       await invoke<void>("stop_scrcpy", { deviceId });
       delete state.scrcpySessionOptions[deviceId];
-      state.androidMessage = `已关闭 scrcpy: ${deviceId}`;
     } else {
       const options = copyScrcpyOptions(state.scrcpyOptions);
       await invoke<void>("start_scrcpy", {
@@ -1514,7 +1509,6 @@ async function toggleScrcpy(): Promise<void> {
         options,
       });
       state.scrcpySessionOptions[deviceId] = options;
-      state.androidMessage = `已打开 scrcpy: ${deviceId}`;
     }
   } catch (error) {
     state.androidError = toMessage(error);
@@ -1562,7 +1556,6 @@ async function openAdbShell(): Promise<void> {
     const result = await invoke<AdbShellStartPayload>("start_adb_shell", { deviceId });
     const activeShell = ensureAdbShellSession(result.device_id, true, true, result.shell_id);
     activeShell.terminal.writeln(`\x1b[32mADB Shell 已打开: ${result.device_id}\x1b[0m`);
-    state.androidMessage = `已打开 ADB Shell: ${result.device_id}`;
   } catch (error) {
     state.androidError = toMessage(error);
     removeAdbShellSession(deviceId);
