@@ -298,6 +298,22 @@
   - `findings.md`
   - `progress.md`
 
+### 阶段 19：放宽 ADB 启动与命令超时
+- **状态：** complete
+- 执行的操作：
+  - 读取用户反馈，确认当前 3 秒普通 ADB 命令超时会把 adb server 启动慢误判为失败。
+  - 盘点 `ADB_CONNECT_TIMEOUT_MS`、`ADB_COMMAND_TIMEOUT_MS` 和 `run_adb_command()` 的调用点。
+  - 新增 `ADB_SERVER_START_TIMEOUT_MS = 20_000`，在实际执行 ADB 命令前先确保 `adb start-server` 成功。
+  - 用全局原子标志和互斥锁保护首次 adb server 启动，避免并发刷新/连接时重复启动。
+  - 将普通 ADB 命令超时从 3 秒放宽到 8 秒，将远程连接超时从 4 秒放宽到 8 秒。
+  - 保留命令级超时，避免远程设备不存在时无限等待。
+  - 运行 Rust 格式化、`cargo check`、前端构建和 `git diff --check` 验证。
+- 创建/修改的文件：
+  - `src-tauri/src/lib.rs`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -366,6 +382,10 @@
 | `cargo check --manifest-path src-tauri\Cargo.toml` | 崩溃/强杀兜底改动后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run build` | 崩溃/强杀兜底改动后 | 前端构建仍通过 | 构建通过；仅有 npm 版本提示 | 通过 |
 | `git diff --check` | 崩溃/强杀兜底改动后 | 无空白错误 | 通过，仅有 CRLF 提示 | 通过 |
+| `cargo fmt --manifest-path src-tauri\Cargo.toml` | ADB 超时策略优化后 | Rust 格式化完成 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `cargo check --manifest-path src-tauri\Cargo.toml` | ADB 超时策略优化后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
+| `npm run build` | ADB 超时策略优化后 | 前端构建仍通过 | 构建通过；仅有 npm 版本提示 | 通过 |
+| `git diff --check` | ADB 超时策略优化后 | 无空白错误 | 通过，仅有 CRLF 提示 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -387,15 +407,16 @@
 | 2026-09-10 | 窗口拉伸时终端边缘出现周期性黑色区域 | 1 | 覆盖 xterm 内部默认黑色背景并让 screen 最小铺满 host |
 | 2026-09-14 | 关闭软件时可能残留串口、ADB shell 或 scrcpy 进程 | 1 | 在后端窗口关闭事件中统一 cleanup，并给 SerialManager 增加 Drop 兜底 |
 | 2026-09-14 | 主进程崩溃或被强杀时进程内清理逻辑不会可靠执行 | 1 | 使用 Windows Job Object 的 `KILL_ON_JOB_CLOSE` 托管 scrcpy 和 ADB Shell 子进程，串口由系统关闭 HANDLE |
+| 2026-09-15 | ADB 首次启动慢时 3 秒超时容易误判 | 1 | 新增独立 `adb start-server` 20 秒启动窗口，并把实际 ADB 命令超时放宽到 8 秒 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 18：崩溃/强杀时清理 scrcpy 和 ADB shell 子进程兜底 |
-| 我要去哪里？ | 等待用户实机确认强杀主程序时不会残留 scrcpy/ADB shell 子进程 |
+| 我在哪里？ | 完成阶段 19：ADB 启动慢时的超时误判优化 |
+| 我要去哪里？ | 等待用户实机确认首次启动 adb server、刷新设备和远程连接不再过早超时 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
-| 我做了什么？ | 增加 Windows Job Object 托管长生命周期子进程，并保持正常退出 cleanup 不变 |
+| 我做了什么？ | 为 ADB server 启动增加独立长超时，并放宽普通 ADB 命令/连接命令超时 |
 
 ---
 *每个阶段完成后或遇到错误时更新此文件*

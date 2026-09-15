@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     env,
     io::{ErrorKind, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -41,11 +41,14 @@ const SERIAL_EMIT_INTERVAL_MS: u64 = 2;
 const SERIAL_EMIT_BUFFER_LIMIT: usize = 4 * 1024;
 const SERIAL_WRITE_BUFFER_LIMIT: usize = 256;
 const SERIAL_PERF_WARN_MS: u128 = 25;
-const ADB_CONNECT_TIMEOUT_MS: u64 = 4_000;
-const ADB_COMMAND_TIMEOUT_MS: u64 = 3_000;
+const ADB_SERVER_START_TIMEOUT_MS: u64 = 20_000;
+const ADB_CONNECT_TIMEOUT_MS: u64 = 8_000;
+const ADB_COMMAND_TIMEOUT_MS: u64 = 8_000;
 const COMMAND_POLL_INTERVAL_MS: u64 = 25;
 const COMMAND_OUTPUT_DRAIN_TIMEOUT_MS: u64 = 250;
 const PROCESS_TERMINATE_TIMEOUT_MS: u64 = 500;
+static ADB_SERVER_STARTED: AtomicBool = AtomicBool::new(false);
+static ADB_SERVER_START_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct SerialManager {
@@ -1047,6 +1050,31 @@ fn normalize_scrcpy_options(options: ScrcpyOptions) -> Result<ScrcpyOptions, Str
 
 fn run_adb_command(args: &[&str], timeout_ms: u64) -> Result<String, String> {
     let adb_path = find_tool_path("adb")?;
+    ensure_adb_server_started(&adb_path)?;
+    run_adb_command_with_path(&adb_path, args, timeout_ms)
+}
+
+fn ensure_adb_server_started(adb_path: &Path) -> Result<(), String> {
+    if ADB_SERVER_STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    let _guard = ADB_SERVER_START_LOCK
+        .lock()
+        .map_err(|_| "ADB server 启动锁已损坏".to_string())?;
+    if ADB_SERVER_STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    run_adb_command_with_path(adb_path, &["start-server"], ADB_SERVER_START_TIMEOUT_MS)
+        .map(|_| ADB_SERVER_STARTED.store(true, Ordering::Release))
+}
+
+fn run_adb_command_with_path(
+    adb_path: &Path,
+    args: &[&str],
+    timeout_ms: u64,
+) -> Result<String, String> {
     let mut command = Command::new(&adb_path);
     if let Some(adb_dir) = adb_path.parent() {
         command.current_dir(adb_dir);

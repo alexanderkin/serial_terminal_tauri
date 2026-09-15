@@ -63,6 +63,7 @@
 - 被任务管理器强杀、段错误崩溃等非正常退出时，Rust `Drop`、Tauri `CloseRequested` 和普通清理函数都不能保证执行；需要依赖操作系统资源所有权和子进程托管机制。
 - Windows 会在进程结束时自动关闭该进程持有的串口 HANDLE，因此串口占用在崩溃/强杀后会由系统释放；scrcpy 和 `adb shell` 是独立子进程，需要放进 Job Object 才能跟随主进程消亡。
 - `windows-sys 0.52.0` 已提供 `CreateJobObjectW`、`SetInformationJobObject`、`AssignProcessToJobObject`、`JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 和 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，可直接用于本项目的 Windows 子进程兜底清理。
+- ADB 首次调用可能隐式启动 adb server，原先 `ADB_COMMAND_TIMEOUT_MS = 3000`、`ADB_CONNECT_TIMEOUT_MS = 4000` 会把“server 启动慢”误判成命令失败。
 
 ## 技术决策
 | 决策 | 理由 |
@@ -96,6 +97,7 @@
 | 退出清理由后端生命周期统一处理 | 串口句柄和 adb/scrcpy 子进程属于后端资源；窗口关闭时直接从 Tauri 后端清理比依赖前端异步调用更可靠 |
 | 崩溃/强杀场景对子进程使用 Windows Job Object | 进程被强杀或崩溃时 Rust 代码不能保证继续执行；Job Object 的 `KILL_ON_JOB_CLOSE` 能让系统在主进程句柄关闭后自动结束已加入的子进程 |
 | Job Object 仅托管长生命周期子进程 | `adb connect/devices` 这类短命令不放入长生命周期 Job，避免影响 adb server；仅将 scrcpy 和交互式 `adb shell` 加入主进程生命周期托管 |
+| ADB 首次启动和具体命令分开设置超时 | 首次 `adb start-server` 使用更长 20 秒窗口；普通 ADB 命令和远程连接命令放宽到 8 秒，既减少误判也避免设备不存在时无限等待 |
 
 ## 遇到的问题
 | 问题 | 解决方案 |
@@ -118,6 +120,7 @@
 | xterm resize 黑边 | 将 root、viewport、screen、scroll area、scrollable element、scrollbar track 统一设为 `--terminal`，并给 screen 设置最小 100% 宽高 |
 | 关闭软件后可能残留串口、ADB shell 或 scrcpy 进程 | 给 `SerialManager` 增加 Drop 兜底，并在 `CloseRequested` 窗口事件中主动调用串口、ADB shell、scrcpy 的统一 cleanup |
 | 主进程崩溃/强杀时进程内 cleanup 无法可靠执行 | 用 Windows Job Object 管理 scrcpy/ADB Shell 子进程，主进程消亡时 Job 句柄关闭并由系统结束子进程；串口 HANDLE 由系统自动关闭 |
+| ADB 启动慢导致 3 秒超时误判 | 在执行实际 ADB 命令前先用 20 秒超时启动 adb server，并将普通命令/连接命令超时提高到 8 秒 |
 
 ## 资源
 - 本地 `serial_terminal` Tauri 项目。
@@ -137,6 +140,7 @@
 - 本轮 `codex/xterm-js` 分支 Tauri dev 已启动到 `target\debug\serial_terminal.exe`，无立即崩溃。
 - 本轮退出清理改动后，`cargo check --manifest-path src-tauri\Cargo.toml` 通过，`git diff --check` 通过；仅有已知路径 canonicalize 和 CRLF 提醒。
 - 本轮崩溃/强杀兜底改动后，`cargo check --manifest-path src-tauri\Cargo.toml`、`npm run build` 和 `git diff --check` 均通过；仅有已知路径 canonicalize、npm 版本提示和 CRLF 提醒。
+- 本轮 ADB 超时策略优化后，`cargo check --manifest-path src-tauri\Cargo.toml`、`npm run build` 和 `git diff --check` 均通过；仅有已知路径 canonicalize、npm 版本提示和 CRLF 提醒。
 
 ---
 *每执行2次查看/浏览器或搜索操作后更新此文件*
